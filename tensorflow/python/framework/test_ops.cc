@@ -19,6 +19,7 @@ limitations under the License.
 #include "tensorflow/core/framework/resource_handle.pb.h"
 #include "tensorflow/core/framework/resource_mgr.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/public/version.h"
 
 namespace tensorflow {
 
@@ -30,6 +31,16 @@ REGISTER_OP("GraphDefVersion")
     .Output("version: int32")
     .SetIsStateful()
     .SetShapeFn(shape_inference::ScalarShape);
+
+REGISTER_OP("RequiresOlderGraphVersion")
+    .Output("version: int32")
+    .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      if (c->graph_def_version() != TF_GRAPH_DEF_VERSION - 1) {
+        return errors::InvalidArgument("Wrong graph version for shape");
+      }
+      return shape_inference::ScalarShape(c);
+    });
 
 REGISTER_OP("Old")
     .SetShapeFn(shape_inference::UnknownShape)
@@ -150,7 +161,7 @@ class ResourceUsingOp : public OpKernel {
  public:
   explicit ResourceUsingOp(OpKernelConstruction* context) : OpKernel(context) {}
 
-  void Compute(OpKernelContext* ctx) {
+  void Compute(OpKernelContext* ctx) override {
     StubResource* unused;
     OP_REQUIRES_OK(ctx, LookupResource<StubResource>(
                             ctx, HandleFromInput(ctx, 0), &unused));

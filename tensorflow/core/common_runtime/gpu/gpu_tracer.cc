@@ -215,7 +215,7 @@ Status CUPTIManager::DisableTrace() {
 void CUPTIManager::InternalBufferRequested(uint8_t **buffer, size_t *size,
                                            size_t *maxNumRecords) {
   VLOG(2) << "BufferRequested";
-  void *p = port::aligned_malloc(kBufferSize, kBufferAlignment);
+  void *p = port::AlignedMalloc(kBufferSize, kBufferAlignment);
   *size = kBufferSize;
   *buffer = reinterpret_cast<uint8_t *>(p);
   *maxNumRecords = 0;
@@ -246,7 +246,7 @@ void CUPTIManager::InternalBufferCompleted(CUcontext ctx, uint32_t streamId,
       LOG(WARNING) << "Dropped " << dropped << " activity records";
     }
   }
-  port::aligned_free(buffer);
+  port::AlignedFree(buffer);
 }
 
 CUPTIManager *GetCUPTIManager() {
@@ -288,6 +288,7 @@ class GPUTracerImpl : public GPUTracer,
                       public port::Tracing::Engine {
  public:
   GPUTracerImpl();
+  ~GPUTracerImpl() override;
 
   // GPUTracer interface:
   Status Start() override;
@@ -307,7 +308,7 @@ class GPUTracerImpl : public GPUTracer,
         // Remember the most recent ScopedAnnotation for each thread.
         tls_current_annotation.get() = annotation.c_str();
       }
-      ~Impl() { tls_current_annotation.get() = nullptr; }
+      ~Impl() override { tls_current_annotation.get() = nullptr; }
     };
     return new Impl(name);
   }
@@ -380,6 +381,12 @@ GPUTracerImpl::GPUTracerImpl() {
   CHECK(cupti_manager_);
   cupti_wrapper_.reset(new perftools::gputools::profiler::CuptiWrapper());
   enabled_ = false;
+}
+
+GPUTracerImpl::~GPUTracerImpl() {
+  // Unregister the CUPTI callbacks if needed to prevent them from accessing
+  // freed memory.
+  Stop().IgnoreError();
 }
 
 Status GPUTracerImpl::Start() {
@@ -561,7 +568,6 @@ Status GPUTracerImpl::Collect(StepStatsCollector *collector) {
   const int id = 0;
   const string stream_device = strings::StrCat(prefix, "/gpu:", id, "/stream:");
   const string memcpy_device = strings::StrCat(prefix, "/gpu:", id, "/memcpy");
-  const string sync_device = strings::StrCat(prefix, "/gpu:", id, "/sync");
 
   mutex_lock l2(trace_mu_);
   for (const auto &rec : kernel_records_) {

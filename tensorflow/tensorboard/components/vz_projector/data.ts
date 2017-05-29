@@ -18,7 +18,7 @@ import {SpriteMetadata} from './data-provider';
 import * as knn from './knn';
 import * as logging from './logging';
 import * as scatterPlot from './scatterPlot';
-import {getSearchPredicate, runAsyncTask, shuffle} from './util';
+import * as util from './util';
 import * as vector from './vector';
 
 export type DistanceFunction = (a: number[], b: number[]) => number;
@@ -52,8 +52,8 @@ export interface SpriteAndMetadataInfo {
   spriteMetadata?: SpriteMetadata;
 }
 
-/** A single collection of points which make up a trace through space. */
-export interface DataTrace {
+/** A single collection of points which make up a sequence through space. */
+export interface Sequence {
   /** Indices into the DataPoints array in the Data object. */
   pointIndices: number[];
 }
@@ -68,8 +68,8 @@ export interface DataPoint {
    */
   metadata: PointMetadata;
 
-  /** index of the trace, used for highlighting on click */
-  traceIndex?: number;
+  /** index of the sequence, used for highlighting on click */
+  sequenceIndex?: number;
 
   /** index in the original data source */
   index: number;
@@ -78,21 +78,9 @@ export interface DataPoint {
   projections: {[key: string]: number};
 }
 
-/** Checks to see if the browser supports webgl. */
-function hasWebGLSupport(): boolean {
-  try {
-    let c = document.createElement('canvas');
-    let gl = c.getContext('webgl') || c.getContext('experimental-webgl');
-    return gl != null && typeof weblas !== 'undefined';
-  } catch (e) {
-    return false;
-  }
-}
-
-const WEBGL_SUPPORT = hasWebGLSupport();
 const IS_FIREFOX = navigator.userAgent.toLowerCase().indexOf('firefox') >= 0;
 /** Controls whether nearest neighbors computation is done on the GPU or CPU. */
-const KNN_GPU_ENABLED = WEBGL_SUPPORT && !IS_FIREFOX;
+const KNN_GPU_ENABLED = util.hasWebGLSupport() && !IS_FIREFOX;
 
 export const TSNE_SAMPLE_SIZE = 10000;
 export const PCA_SAMPLE_SIZE = 50000;
@@ -100,8 +88,25 @@ export const PCA_SAMPLE_SIZE = 50000;
 export const PCA_SAMPLE_DIM = 200;
 /** Number of pca components to compute. */
 const NUM_PCA_COMPONENTS = 10;
-/** Reserved metadata attribute used for trace information. */
-const TRACE_METADATA_ATTR = '__next__';
+/**
+ * Reserved metadata attributes used for sequence information
+ * NOTE: Use "__seq_next__" as "__next__" is deprecated.
+ */
+const SEQUENCE_METADATA_ATTRS = ['__next__', '__seq_next__'];
+
+function getSequenceNextPointIndex(pointMetadata: PointMetadata): number|null {
+  let sequenceAttr = null;
+  for (let metadataAttr of SEQUENCE_METADATA_ATTRS) {
+    if (metadataAttr in pointMetadata && pointMetadata[metadataAttr] !== '') {
+      sequenceAttr = pointMetadata[metadataAttr];
+      break;
+    }
+  }
+  if (sequenceAttr == null) {
+    return null;
+  }
+  return +sequenceAttr;
+}
 
 /**
  * Dataset contains a DataPoints array that should be treated as immutable. This
@@ -112,7 +117,7 @@ const TRACE_METADATA_ATTR = '__next__';
  */
 export class DataSet {
   points: DataPoint[];
-  traces: DataTrace[];
+  sequences: Sequence[];
 
   shuffledDataIndices: number[] = [];
 
@@ -120,7 +125,7 @@ export class DataSet {
    * This keeps a list of all current projections so you can easily test to see
    * if it's been calculated already.
    */
-  projections = d3.set();
+  projections: {[projection: string]: boolean} = {};
   nearest: knn.NearestEntry[][];
   nearestK: number;
   tSNEIteration: number = 0;
@@ -136,54 +141,54 @@ export class DataSet {
   constructor(
       points: DataPoint[], spriteAndMetadataInfo?: SpriteAndMetadataInfo) {
     this.points = points;
-    this.shuffledDataIndices = shuffle(d3.range(this.points.length));
-    this.traces = this.computeTraces(points);
+    this.shuffledDataIndices = util.shuffle(util.range(this.points.length));
+    this.sequences = this.computeSequences(points);
     this.dim = [this.points.length, this.points[0].vector.length];
     this.spriteAndMetadataInfo = spriteAndMetadataInfo;
   }
 
-  private computeTraces(points: DataPoint[]) {
-    // Keep a list of indices seen so we don't compute traces for a given
+  private computeSequences(points: DataPoint[]) {
+    // Keep a list of indices seen so we don't compute sequences for a given
     // point twice.
     let indicesSeen = new Int8Array(points.length);
-    // Compute traces.
-    let indexToTrace: {[index: number]: DataTrace} = {};
-    let traces: DataTrace[] = [];
+    // Compute sequences.
+    let indexToSequence: {[index: number]: Sequence} = {};
+    let sequences: Sequence[] = [];
     for (let i = 0; i < points.length; i++) {
       if (indicesSeen[i]) {
         continue;
       }
       indicesSeen[i] = 1;
 
-      // Ignore points without a trace attribute.
-      let next = points[i].metadata[TRACE_METADATA_ATTR];
-      if (next == null || next === '') {
+      // Ignore points without a sequence attribute.
+      let next = getSequenceNextPointIndex(points[i].metadata);
+      if (next == null) {
         continue;
       }
-      if (next in indexToTrace) {
-        let existingTrace = indexToTrace[+next];
+      if (next in indexToSequence) {
+        let existingSequence = indexToSequence[next];
         // Pushing at the beginning of the array.
-        existingTrace.pointIndices.unshift(i);
-        indexToTrace[i] = existingTrace;
+        existingSequence.pointIndices.unshift(i);
+        indexToSequence[i] = existingSequence;
         continue;
       }
-      // The current point is pointing to a new/unseen trace.
-      let newTrace: DataTrace = {pointIndices: []};
-      indexToTrace[i] = newTrace;
-      traces.push(newTrace);
+      // The current point is pointing to a new/unseen sequence.
+      let newSequence: Sequence = {pointIndices: []};
+      indexToSequence[i] = newSequence;
+      sequences.push(newSequence);
       let currentIndex = i;
       while (points[currentIndex]) {
-        newTrace.pointIndices.push(currentIndex);
-        let next = points[currentIndex].metadata[TRACE_METADATA_ATTR];
-        if (next != null && next !== '') {
-          indicesSeen[+next] = 1;
-          currentIndex = +next;
+        newSequence.pointIndices.push(currentIndex);
+        let next = getSequenceNextPointIndex(points[currentIndex].metadata);
+        if (next != null) {
+          indicesSeen[next] = 1;
+          currentIndex = next;
         } else {
           currentIndex = -1;
         }
       }
     }
-    return traces;
+    return sequences;
   }
 
   projectionCanBeRendered(projection: ProjectionType): boolean {
@@ -236,7 +241,7 @@ export class DataSet {
 
   /** Projects the dataset onto a given vector and caches the result. */
   projectLinear(dir: vector.Vector, label: string) {
-    this.projections.add(label);
+    this.projections[label] = true;
     this.points.forEach(dataPoint => {
       dataPoint.projections[label] = vector.dot(dataPoint.vector, dir);
     });
@@ -244,10 +249,10 @@ export class DataSet {
 
   /** Projects the dataset along the top 10 principal components. */
   projectPCA(): Promise<void> {
-    if (this.projections.has('pca-0')) {
+    if (this.projections['pca-0'] != null) {
       return Promise.resolve<void>(null);
     }
-    return runAsyncTask('Computing PCA...', () => {
+    return util.runAsyncTask('Computing PCA...', () => {
       // Approximate pca vectors by sampling the dimensions.
       let dim = this.points[0].vector.length;
       let vectors = this.shuffledDataIndices.map(i => this.points[i].vector);
@@ -285,7 +290,7 @@ export class DataSet {
       });
       for (let d = 0; d < NUM_PCA_COMPONENTS; d++) {
         let label = 'pca-' + d;
-        this.projections.add(label);
+        this.projections[label] = true;
         for (let i = 0; i < pcaVectors.length; i++) {
           let pointIndex = this.shuffledDataIndices[i];
           this.points[pointIndex].projections[label] = pcaVectors[i][d];
@@ -345,21 +350,51 @@ export class DataSet {
     }
     knnComputation.then(nearest => {
       this.nearest = nearest;
-      runAsyncTask('Initializing T-SNE...', () => {
-        this.tsne.initDataDist(this.nearest);
-      }).then(step);
+      util.runAsyncTask('Initializing T-SNE...', () => {
+            this.tsne.initDataDist(this.nearest);
+          }).then(step);
     });
   }
 
-  mergeMetadata(metadata: SpriteAndMetadataInfo) {
+  /**
+   * Merges metadata to the dataset and returns whether it succeeded.
+   */
+  mergeMetadata(metadata: SpriteAndMetadataInfo): boolean {
     if (metadata.pointsInfo.length !== this.points.length) {
-      logging.setWarningMessage(
-          `Number of tensors (${this.points.length}) do not match` +
-          ` the number of lines in metadata (${metadata.pointsInfo.length}).`);
+      let errorMessage = `Number of tensors (${this.points.length}) do not` +
+          ` match the number of lines in metadata` +
+          ` (${metadata.pointsInfo.length}).`;
+
+      if (metadata.stats.length === 1 &&
+          this.points.length + 1 === metadata.pointsInfo.length) {
+        // If there is only one column of metadata and the number of points is
+        // exactly one less than the number of metadata lines, this is due to an
+        // unnecessary header line in the metadata and we can show a meaningful
+        // error.
+        logging.setErrorMessage(
+            errorMessage + ' Single column metadata should not have a header ' +
+                'row.',
+            'merging metadata');
+        return false;
+      } else if (
+          metadata.stats.length > 1 &&
+          this.points.length - 1 === metadata.pointsInfo.length) {
+        // If there are multiple columns of metadata and the number of points is
+        // exactly one greater than the number of lines in the metadata, this
+        // means there is a missing metadata header.
+        logging.setErrorMessage(
+            errorMessage + ' Multi-column metadata should have a header ' +
+                'row with column labels.',
+            'merging metadata');
+        return false;
+      }
+
+      logging.setWarningMessage(errorMessage);
     }
     this.spriteAndMetadataInfo = metadata;
     metadata.pointsInfo.slice(0, this.points.length)
         .forEach((m, i) => this.points[i].metadata = m);
+    return true;
   }
 
   stopTSNE() {
@@ -384,7 +419,7 @@ export class DataSet {
    * Search the dataset based on a metadata field.
    */
   query(query: string, inRegexMode: boolean, fieldName: string): number[] {
-    let predicate = getSearchPredicate(query, inRegexMode, fieldName);
+    let predicate = util.getSearchPredicate(query, inRegexMode, fieldName);
     let matches: number[] = [];
     this.points.forEach((point, id) => {
       if (predicate(point)) {
@@ -413,6 +448,7 @@ export interface ColorOption {
   /** Threshold values and their colors. Defined for gradient color map. */
   thresholds?: {value: number, color: string}[];
   isSeparator?: boolean;
+  tooManyUniqueValues?: boolean;
 }
 
 /**
@@ -466,6 +502,7 @@ export class State {
 
   /** Color by option. */
   selectedColorOptionName: string;
+  forceCategoricalColoring: boolean;
 
   /** Label by option. */
   selectedLabelOption: string;

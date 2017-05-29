@@ -120,7 +120,7 @@ class SparseTensorAccessingOp : public OpKernel {
       : OpKernel(context), sparse_tensors_map_(nullptr) {}
 
  protected:
-  ~SparseTensorAccessingOp() {
+  ~SparseTensorAccessingOp() override {
     if (sparse_tensors_map_) sparse_tensors_map_->Unref();
   }
 
@@ -343,7 +343,7 @@ class TakeManySparseFromTensorsMapOp : public SparseTensorAccessingOp {
       : SparseTensorAccessingOp(context) {}
 
   void Compute(OpKernelContext* context) override {
-    SparseTensorsMap* map;
+    SparseTensorsMap* map = nullptr;
     OP_REQUIRES_OK(context, GetMap(context, false /* is_writing */, &map));
 
     const Tensor& sparse_handles = context->input(0);

@@ -19,11 +19,11 @@ from __future__ import division
 from __future__ import print_function
 
 from tensorflow.contrib.linalg.python.ops import linear_operator
+from tensorflow.contrib.linalg.python.ops import linear_operator_util
 from tensorflow.python.framework import dtypes
 from tensorflow.python.framework import ops
 from tensorflow.python.ops import array_ops
 from tensorflow.python.ops import check_ops
-from tensorflow.python.ops import control_flow_ops
 from tensorflow.python.ops import math_ops
 
 __all__ = ["LinearOperatorDiag",]
@@ -32,7 +32,7 @@ __all__ = ["LinearOperatorDiag",]
 class LinearOperatorDiag(linear_operator.LinearOperator):
   """`LinearOperator` acting like a [batch] square diagonal matrix.
 
-  This operator acts like a [batch] matrix `A` with shape
+  This operator acts like a [batch] diagonal matrix `A` with shape
   `[B1,...,Bb, N, N]` for some `b >= 0`.  The first `b` indices index a
   batch member.  For every batch index `(i1,...,ib)`, `A[i1,...,ib, : :]` is
   an `N x N` matrix.  This matrix `A` is not materialized, but for
@@ -52,11 +52,11 @@ class LinearOperatorDiag(linear_operator.LinearOperator):
   operator.shape
   ==> [2, 2]
 
-  operator.log_determinant()
+  operator.log_abs_determinant()
   ==> scalar Tensor
 
   x = ... Shape [2, 4] Tensor
-  operator.apply(x)
+  operator.matmul(x)
   ==> Shape [2, 4] Tensor
 
   # Create a [2, 3] batch of 4 x 4 linear operators.
@@ -68,13 +68,13 @@ class LinearOperatorDiag(linear_operator.LinearOperator):
   # operator.batch_shape = [2, 3].
   y = tf.random_normal(shape=[2, 1, 4, 2])
   x = operator.solve(y)
-  ==> operator.apply(x) = y
+  ==> operator.matmul(x) = y
   ```
 
-  ### Shape compatibility
+  #### Shape compatibility
 
   This operator acts on [batch] matrix with compatible shape.
-  `x` is a batch matrix with compatible shape for `apply` and `solve` if
+  `x` is a batch matrix with compatible shape for `matmul` and `solve` if
 
   ```
   operator.shape = [B1,...,Bb] + [N, N],  with b >= 0
@@ -82,22 +82,22 @@ class LinearOperatorDiag(linear_operator.LinearOperator):
   and [C1,...,Cc] broadcasts with [B1,...,Bb] to [D1,...,Dd]
   ```
 
-  ### Performance
+  #### Performance
 
   Suppose `operator` is a `LinearOperatorDiag` of shape `[N, N]`,
   and `x.shape = [N, R]`.  Then
 
-  * `operator.apply(x)` involves `N*R` multiplications.
-  * `operator.solve(x)` involves `N` divisions and `N*R` multiplications.
+  * `operator.matmul(x)` involves `N * R` multiplications.
+  * `operator.solve(x)` involves `N` divisions and `N * R` multiplications.
   * `operator.determinant()` involves a size `N` `reduce_prod`.
 
   If instead `operator` and `x` have shape `[B1,...,Bb, N, N]` and
   `[B1,...,Bb, N, R]`, every operation increases in complexity by `B1*...*Bb`.
 
-  ### Matrix property hints
+  #### Matrix property hints
 
   This `LinearOperator` is initialized with boolean flags of the form `is_X`,
-  for `X = non_singular, self_adjoint` etc...
+  for `X = non_singular, self_adjoint, positive_definite, square`.
   These have the following meaning
   * If `is_X == True`, callers should expect the operator to have the
     property `X`.  This is a promise that should be fulfilled, but is *not* a
@@ -111,74 +111,86 @@ class LinearOperatorDiag(linear_operator.LinearOperator):
   def __init__(self,
                diag,
                is_non_singular=None,
-               is_self_adjoint=True,
+               is_self_adjoint=None,
                is_positive_definite=None,
+               is_square=None,
                name="LinearOperatorDiag"):
-    """Initialize a `LinearOperatorDiag`.
+    r"""Initialize a `LinearOperatorDiag`.
 
     Args:
       diag:  Shape `[B1,...,Bb, N]` `Tensor` with `b >= 0` `N >= 0`.
         The diagonal of the operator.  Allowed dtypes: `float32`, `float64`,
-        `complex64`, `complex128`.
+          `complex64`, `complex128`.
       is_non_singular:  Expect that this operator is non-singular.
       is_self_adjoint:  Expect that this operator is equal to its hermitian
-        transpose.  Since this is a real (not complex) diagonal operator, it is
-        always self adjoint.
+        transpose.  If `diag.dtype` is real, this is auto-set to `True`.
       is_positive_definite:  Expect that this operator is positive definite,
-        meaning the real part of all eigenvalues is positive.  We do not require
-        the operator to be self-adjoint to be positive-definite.  See:
-        https://en.wikipedia.org/wiki/Positive-definite_matrix
+        meaning the quadratic form `x^H A x` has positive real part for all
+        nonzero `x`.  Note that we do not require the operator to be
+        self-adjoint to be positive-definite.  See:
+        https://en.wikipedia.org/wiki/Positive-definite_matrix\
             #Extension_for_non_symmetric_matrices
+      is_square:  Expect that this operator acts like square [batch] matrices.
       name: A name for this `LinearOperator`.
 
     Raises:
       TypeError:  If `diag.dtype` is not an allowed type.
-      ValueError:  If `is_self_adjoint` is not `True`.
+      ValueError:  If `diag.dtype` is real, and `is_self_adjoint` is not `True`.
     """
-
-    allowed_dtypes = [
-        dtypes.float32, dtypes.float64, dtypes.complex64, dtypes.complex128]
 
     with ops.name_scope(name, values=[diag]):
       self._diag = ops.convert_to_tensor(diag, name="diag")
-      dtype = self._diag.dtype
-      if dtype not in allowed_dtypes:
-        raise TypeError(
-            "Argument diag must have dtype in %s.  Found: %s"
-            % (allowed_dtypes, dtype))
-      if dtype.is_floating and not is_self_adjoint:
-        raise ValueError("A real diagonal operator is always self adjoint.")
+      self._check_diag(self._diag)
+
+      # Check and auto-set hints.
+      if not self._diag.dtype.is_complex:
+        if is_self_adjoint is False:
+          raise ValueError("A real diagonal operator is always self adjoint.")
+        else:
+          is_self_adjoint = True
+
+      if is_square is False:
+        raise ValueError("Only square diagonal operators currently supported.")
+      is_square = True
 
       super(LinearOperatorDiag, self).__init__(
-          dtype=dtype,
+          dtype=self._diag.dtype,
           graph_parents=[self._diag],
           is_non_singular=is_non_singular,
           is_self_adjoint=is_self_adjoint,
           is_positive_definite=is_positive_definite,
+          is_square=is_square,
           name=name)
+
+  def _check_diag(self, diag):
+    """Static check of diag."""
+    allowed_dtypes = [
+        dtypes.float32, dtypes.float64, dtypes.complex64, dtypes.complex128]
+
+    dtype = diag.dtype
+    if dtype not in allowed_dtypes:
+      raise TypeError(
+          "Argument diag must have dtype in %s.  Found: %s"
+          % (allowed_dtypes, dtype))
+
+    if diag.get_shape().ndims is not None and diag.get_shape().ndims < 1:
+      raise ValueError("Argument diag must have at least 1 dimension.  "
+                       "Found: %s" % diag)
 
   def _shape(self):
     # If d_shape = [5, 3], we return [5, 3, 3].
     d_shape = self._diag.get_shape()
     return d_shape.concatenate(d_shape[-1:])
 
-  def _shape_dynamic(self):
+  def _shape_tensor(self):
     d_shape = array_ops.shape(self._diag)
     k = d_shape[-1]
-    return array_ops.concat(0, (d_shape, [k]))
+    return array_ops.concat((d_shape, [k]), 0)
 
   def _assert_non_singular(self):
-    if self.dtype.is_complex:
-      should_be_nonzero = math_ops.complex_abs(self._diag)
-    else:
-      should_be_nonzero = self._diag
-
-    nonzero_diag = math_ops.reduce_all(
-        math_ops.logical_not(math_ops.equal(should_be_nonzero, 0)))
-
-    return control_flow_ops.Assert(
-        nonzero_diag,
-        data=["Singular operator: diag contained zero values.", self._diag])
+    return linear_operator_util.assert_no_entries_with_modulus_zero(
+        self._diag,
+        message="Singular operator:  Diagonal contained zero values.")
 
   def _assert_positive_definite(self):
     if self.dtype.is_complex:
@@ -195,14 +207,15 @@ class LinearOperatorDiag(linear_operator.LinearOperator):
         message=message)
 
   def _assert_self_adjoint(self):
-    return _assert_imag_part_zero(
+    return linear_operator_util.assert_zero_imag_part(
         self._diag,
         message=(
             "This diagonal operator contained non-zero imaginary values.  "
             " Thus it was not self-adjoint."))
 
-  def _apply(self, x, adjoint=False):
+  def _matmul(self, x, adjoint=False, adjoint_arg=False):
     diag_term = math_ops.conj(self._diag) if adjoint else self._diag
+    x = linear_operator_util.matrix_adjoint(x) if adjoint_arg else x
     diag_mat = array_ops.expand_dims(diag_term, -1)
     return diag_mat * x
 
@@ -213,30 +226,23 @@ class LinearOperatorDiag(linear_operator.LinearOperator):
     return math_ops.reduce_sum(
         math_ops.log(math_ops.abs(self._diag)), reduction_indices=[-1])
 
-  def _solve(self, rhs, adjoint=False):
+  def _solve(self, rhs, adjoint=False, adjoint_arg=False):
     diag_term = math_ops.conj(self._diag) if adjoint else self._diag
+    rhs = linear_operator_util.matrix_adjoint(rhs) if adjoint_arg else rhs
     inv_diag_mat = array_ops.expand_dims(1. / diag_term, -1)
     return rhs * inv_diag_mat
 
   def _to_dense(self):
     return array_ops.matrix_diag(self._diag)
 
+  def _diag_part(self):
+    return self.diag
+
   def _add_to_tensor(self, x):
     x_diag = array_ops.matrix_diag_part(x)
     new_diag = self._diag + x_diag
     return array_ops.matrix_set_diag(x, new_diag)
 
-
-def _assert_imag_part_zero(x, message=None):
-  """Assert that floating or complex 'x' is real."""
-  dtype = x.dtype.base_dtype
-  if dtype.is_floating:
-    return control_flow_ops.no_op()
-
-  if not dtype.is_complex:
-    raise TypeError(
-        "imag_part_zero only handles float or complex types.  Found: %s"
-        % dtype)
-
-  zero = ops.convert_to_tensor(0, dtype=dtype.real_dtype)
-  return check_ops.assert_equal(zero, math_ops.imag(x), message=message)
+  @property
+  def diag(self):
+    return self._diag

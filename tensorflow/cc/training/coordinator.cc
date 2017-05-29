@@ -31,8 +31,8 @@ Coordinator::Coordinator(const std::vector<error::Code>& clean_stop_errors)
 }
 
 Coordinator::~Coordinator() {
-  RequestStop();
-  Join();
+  RequestStop().IgnoreError();
+  Join().IgnoreError();
 }
 
 Status Coordinator::RegisterRunner(std::unique_ptr<RunnerInterface> runner) {
@@ -46,6 +46,16 @@ Status Coordinator::RegisterRunner(std::unique_ptr<RunnerInterface> runner) {
   mutex_lock l(runners_lock_);
   runners_.push_back(std::move(runner));
   return Status::OK();
+}
+
+bool Coordinator::AllRunnersStopped() {
+  mutex_lock l(runners_lock_);
+  for (const auto& runner : runners_) {
+    if (runner->IsRunning()) {
+      return false;
+    }
+  }
+  return true;
 }
 
 Status Coordinator::RequestStop() {
@@ -103,6 +113,17 @@ void Coordinator::WaitForStop() {
   while (!should_stop_) {
     wait_for_stop_.wait(l);
   }
+}
+
+Status Coordinator::ExportCostGraph(CostGraphDef* cost_graph) const {
+  mutex_lock l(runners_lock_);
+  for (auto& t : runners_) {
+    Status s = t->ExportCostGraph(cost_graph);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  return Status::OK();
 }
 
 }  // namespace

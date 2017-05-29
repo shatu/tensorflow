@@ -13,24 +13,23 @@
 # limitations under the License.
 # ==============================================================================
 
-"""## Generation of summaries.
+"""Tensor summaries for exporting information about a model.
 
-### Class for writing Summaries
+See the @{$python/summary} guide.
+
 @@FileWriter
 @@FileWriterCache
-
-### Summary Ops
 @@tensor_summary
 @@scalar
 @@histogram
 @@audio
 @@image
+@@text
 @@merge
 @@merge_all
-
-## Utilities
 @@get_summary_description
-
+@@get_plugin_asset
+@@get_all_plugin_assets
 """
 
 from __future__ import absolute_import
@@ -40,6 +39,7 @@ from __future__ import print_function
 import re as _re
 
 from google.protobuf import json_format as _json_format
+
 # exports Summary, SummaryDescription, Event, TaggedRunMetadata, SessionLog
 # pylint: disable=unused-import
 from tensorflow.core.framework.summary_pb2 import Summary
@@ -52,16 +52,25 @@ from tensorflow.core.util.event_pb2 import TaggedRunMetadata
 from tensorflow.python.framework import dtypes as _dtypes
 from tensorflow.python.framework import ops as _ops
 from tensorflow.python.ops import gen_logging_ops as _gen_logging_ops
+
 # exports tensor_summary
 # pylint: disable=unused-import
 from tensorflow.python.ops.summary_ops import tensor_summary
 # pylint: enable=unused-import
+
 from tensorflow.python.platform import tf_logging as _logging
+
+# exports text
+# pylint: disable=unused-import
+from tensorflow.python.summary.text_summary import text_summary as text
+# pylint: enable=unused-import
+
 # exports FileWriter, FileWriterCache
 # pylint: disable=unused-import
 from tensorflow.python.summary.writer.writer import FileWriter
 from tensorflow.python.summary.writer.writer_cache import FileWriterCache
 # pylint: enable=unused-import
+
 from tensorflow.python.util import compat as _compat
 from tensorflow.python.util.all_util import remove_undocumented
 
@@ -125,7 +134,7 @@ def scalar(name, tensor, collections=None):
 def image(name, tensor, max_outputs=3, collections=None):
   """Outputs a `Summary` protocol buffer with images.
 
-  The summary has up to `max_images` summary values containing images. The
+  The summary has up to `max_outputs` summary values containing images. The
   images are built from `tensor` which must be 4-D with shape `[batch_size,
   height, width, channels]` and where `channels` can be:
 
@@ -180,6 +189,11 @@ def image(name, tensor, max_outputs=3, collections=None):
 def histogram(name, values, collections=None):
   # pylint: disable=line-too-long
   """Outputs a `Summary` protocol buffer with a histogram.
+
+  Adding a histogram summary makes it possible to visualize your data's
+  distribution in TensorBoard. You can see a detailed explanation of the
+  TensorBoard histogram dashboard
+  [here](https://www.tensorflow.org/get_started/tensorboard_histograms).
 
   The generated
   [`Summary`](https://www.tensorflow.org/code/tensorflow/core/framework/summary.proto)
@@ -273,7 +287,7 @@ def merge(inputs, collections=None, name=None):
     inputs: A list of `string` `Tensor` objects containing serialized `Summary`
       protocol buffers.
     collections: Optional list of graph collections keys. The new summary op is
-      added to these collections. Defaults to `[GraphKeys.SUMMARIES]`.
+      added to these collections. Defaults to `[]`.
     name: A name for the operation (optional).
 
   Returns:

@@ -218,7 +218,7 @@ REGISTER_OP("MatrixInverse")
     .Input("input: T")
     .Output("output: T")
     .Attr("adjoint: bool = False")
-    .Attr("T: {double, float}")
+    .Attr("T: {double, float, complex64, complex128}")
     .SetShapeFn(BatchUnchangedSquareShapeFn)
     .Doc(R"doc(
 Computes the inverse of one or more square invertible matrices or their
@@ -318,7 +318,7 @@ REGISTER_OP("SelfAdjointEigV2")
     .Output("e: T")
     .Output("v: T")
     .Attr("compute_v: bool = True")
-    .Attr("T: {double, float}")
+    .Attr("T: {double, float, complex64, complex128}")
     .SetShapeFn(SelfAdjointEigV2ShapeFn)
     .Doc(R"doc(
 Computes the eigen decomposition of one or more square self-adjoint matrices.
@@ -326,7 +326,7 @@ Computes the eigen decomposition of one or more square self-adjoint matrices.
 Computes the eigenvalues and (optionally) eigenvectors of each inner matrix in
 `input` such that `input[..., :, :] = v[..., :, :] * diag(e[..., :])`.
 
-```prettyprint
+```python
 # a is a tensor.
 # e is a tensor of eigenvalues.
 # v is a tensor of eigenvectors.
@@ -439,14 +439,14 @@ matrix and right-hand sides in the batch:
 If `fast` is `True`, then the solution is computed by solving the normal
 equations using Cholesky decomposition. Specifically, if \\(m \ge n\\) then
 \\(X = (A^T A + \lambda I)^{-1} A^T B\\), which solves the least-squares
-problem \\(X = \mathrm{argmin}_{Z \in \Re^{n \times k}} ||A Z - B||_F^2 +
+problem \\(X = \mathrm{argmin}_{Z \in \Re^{n \times k} } ||A Z - B||_F^2 +
 \lambda ||Z||_F^2\\). If \\(m \lt n\\) then `output` is computed as
 \\(X = A^T (A A^T + \lambda I)^{-1} B\\), which (for \\(\lambda = 0\\)) is the
 minimum-norm solution to the under-determined linear system, i.e.
-\\(X = \mathrm{argmin}_{Z \in \Re^{n \times k}} ||Z||_F^2 \\), subject to
+\\(X = \mathrm{argmin}_{Z \in \Re^{n \times k} } ||Z||_F^2 \\), subject to
 \\(A Z = B\\). Notice that the fast path is only numerically stable when
 \\(A\\) is numerically full rank and has a condition number
-\\(\mathrm{cond}(A) \lt \frac{1}{\sqrt{\epsilon_{mach}}}\\) or\\(\lambda\\) is
+\\(\mathrm{cond}(A) \lt \frac{1}{\sqrt{\epsilon_{mach} } }\\) or\\(\lambda\\) is
 sufficiently large.
 
 If `fast` is `False` an algorithm based on the numerically robust complete
@@ -478,7 +478,7 @@ Computes the QR decompositions of one or more matrices.
 Computes the QR decomposition of each inner matrix in `tensor` such that
 `tensor[..., :, :] = q[..., :, :] * r[..., :,:])`
 
-```prettyprint
+```python
 # a is a tensor.
 # q is a tensor of orthonormal matrices.
 # r is a tensor of upper triangular matrices.
@@ -512,7 +512,7 @@ Computes the singular value decompositions of one or more matrices.
 Computes the SVD of each inner matrix in `input` such that
 `input[..., :, :] = u[..., :, :] * diag(s[..., :, :]) * transpose(v[..., :, :])`
 
-```prettyprint
+```python
 # a is a tensor containing a batch of matrices.
 # s is a tensor of singular values for each matrix.
 # u is the tensor containing of left singular vectors for each matrix.

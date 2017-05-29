@@ -50,7 +50,7 @@ def _MatrixDeterminantGrad(op, grad):
   c = op.outputs[0]
   a_adj_inv = linalg_ops.matrix_inverse(a, adjoint=True)
   multipliers = array_ops.reshape(
-      grad * c, array_ops.concat(0, [array_ops.shape(c), [1, 1]]))
+      grad * c, array_ops.concat([array_ops.shape(c), [1, 1]], 0))
   return multipliers * a_adj_inv
 
 
@@ -212,7 +212,7 @@ def _SelfAdjointEigV2Grad(op, grad_e, grad_v):
     # The forward op only depends on the lower triangular part of a, so here we
     # symmetrize and take the lower triangle
     grad_a = array_ops.matrix_band_part(
-        grad_a + array_ops.matrix_transpose(grad_a), -1, 0)
+        grad_a + math_ops.conj(array_ops.matrix_transpose(grad_a)), -1, 0)
     grad_a = array_ops.matrix_set_diag(grad_a,
                                        0.5 * array_ops.matrix_diag_part(grad_a))
     return grad_a

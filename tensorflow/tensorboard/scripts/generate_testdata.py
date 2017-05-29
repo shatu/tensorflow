@@ -30,7 +30,8 @@ import numpy as np
 from six.moves import xrange  # pylint: disable=redefined-builtin
 import tensorflow as tf
 
-tf.flags.DEFINE_string("target", None, """The directoy where serialized data
+
+tf.flags.DEFINE_string("target", None, """The directory where serialized data
 will be written""")
 
 tf.flags.DEFINE_boolean("overwrite", False, """Whether to remove and overwrite
@@ -68,13 +69,14 @@ def _MakeHistogram(values):
   bucket_limit = [lc[0] for lc in limit_counts]
   bucket = [lc[1] for lc in limit_counts]
   sum_sq = sum(v * v for v in values)
-  return tf.HistogramProto(min=min(values),
-                           max=max(values),
-                           num=len(values),
-                           sum=sum(values),
-                           sum_squares=sum_sq,
-                           bucket_limit=bucket_limit,
-                           bucket=bucket)
+  return tf.HistogramProto(
+      min=min(values),
+      max=max(values),
+      num=len(values),
+      sum=sum(values),
+      sum_squares=sum_sq,
+      bucket_limit=bucket_limit,
+      bucket=bucket)
 
 
 def WriteScalarSeries(writer, tag, f, n=5):
@@ -110,7 +112,7 @@ def WriteImageSeries(writer, tag, n_images=1):
   step = 0
   session = tf.Session()
   p = tf.placeholder("uint8", (1, 4, 4, 3))
-  s = tf.contrib.deprecated.image_summary(tag, p)
+  s = tf.summary.image(tag, p)
   for _ in xrange(n_images):
     im = np.random.random_integers(0, 255, (1, 4, 4, 3))
     summ = session.run(s, feed_dict={p: im})
@@ -127,23 +129,24 @@ def WriteAudioSeries(writer, tag, n_audio=1):
   min_frequency_hz = 440
   max_frequency_hz = 880
   sample_rate = 4000
-  duration_frames = sample_rate * 0.5  # 0.5 seconds.
+  duration_frames = sample_rate // 2  # 0.5 seconds.
   frequencies_per_run = 1
   num_channels = 2
 
   p = tf.placeholder("float32", (frequencies_per_run, duration_frames,
                                  num_channels))
-  s = tf.contrib.deprecated.audio_summary(tag, p, sample_rate)
+  s = tf.summary.audio(tag, p, sample_rate)
 
   for _ in xrange(n_audio):
     # Generate a different frequency for each channel to show stereo works.
     frequencies = np.random.random_integers(
-        min_frequency_hz, max_frequency_hz,
+        min_frequency_hz,
+        max_frequency_hz,
         size=(frequencies_per_run, num_channels))
     tiled_frequencies = np.tile(frequencies, (1, duration_frames))
     tiled_increments = np.tile(
-        np.arange(0, duration_frames), (num_channels, 1)).T.reshape(
-            1, duration_frames * num_channels)
+        np.arange(0, duration_frames),
+        (num_channels, 1)).T.reshape(1, duration_frames * num_channels)
     tones = np.sin(2.0 * np.pi * tiled_frequencies * tiled_increments /
                    sample_rate)
     tones = tones.reshape(frequencies_per_run, duration_frames, num_channels)

@@ -74,28 +74,6 @@ struct RecvInfo {
 typedef std::unordered_map<DupRecvKey, RecvInfo, DupRecvKeyHash, DupRecvKeyEq>
     DupRecvTable;
 
-struct DupControlKey {
-  int dst_node_id;      // Edge's dst node id
-  GraphDef* src_graph;  // Edge's src node is in this subgraph
-};
-
-struct DupControlKeyHash {
-  size_t operator()(const DupControlKey& k) const {
-    return Hash64(reinterpret_cast<const char*>(&k.src_graph),
-                  sizeof(k.src_graph), k.dst_node_id);
-  }
-};
-
-struct DupControlKeyEq {
-  bool operator()(const DupControlKey& x, const DupControlKey& y) const {
-    return (x.dst_node_id == y.dst_node_id) && (x.src_graph == y.src_graph);
-  }
-};
-
-typedef std::unordered_map<DupControlKey, NodeDef*, DupControlKeyHash,
-                           DupControlKeyEq>
-    DupControlTable;
-
 struct PairIntHash {
  public:
   std::size_t operator()(const std::pair<int, int>& x) const {
@@ -358,14 +336,11 @@ void OptimizeControlFlowColocation(Graph* graph) {
         const Edge* data_edge = nullptr;
         for (const Edge* out_edge : node->out_edges()) {
           if (!out_edge->IsControlEdge()) {
-            if (data_edge) {
-              data_edge = nullptr;
-              return;
-            }
             data_edge = out_edge;
+            break;
           }
         }
-        // Colocate if there is only one downstream data node.
+        // Colocate with the first downstream data node.
         if (data_edge) {
           node->set_assigned_device_name(
               data_edge->dst()->assigned_device_name());
@@ -381,7 +356,7 @@ string ControlLoopName(const string& name) {
 }
 
 bool IsControlLoop(const Node* node) {
-  const string& name = node->def().name();
+  const string& name = node->name();
   return StringPiece(name).starts_with("_cloop");
 }
 
@@ -493,7 +468,7 @@ Status AddControlLoop(const PartitionOptions& opts, Graph* g, const Node* src,
   const string& device_name = edge->dst()->assigned_device_name();
   const string& frame_name = src_info.frame_name;
   int parallel_iterations;
-  status = GetNodeAttr(src_info.frame->def(), "parallel_iterations",
+  status = GetNodeAttr(src_info.frame->attrs(), "parallel_iterations",
                        &parallel_iterations);
   if (!status.ok()) return status;
 
@@ -544,9 +519,7 @@ Status BuildMemoryDeviceInfo(const Graph& g, GraphInfo* info) {
   MemoryTypeVector output_memory_types;
 
   info->device_types.resize(g.num_node_ids(), DEVICE_CPU);
-  for (const Node* node : g.nodes()) {
-    if (!node->IsOp()) continue;  // Skip Sink/Source nodes.
-
+  for (const Node* node : g.op_nodes()) {
     DeviceNameUtils::ParsedName parsed;
     if (!DeviceNameUtils::ParseFullName(node->assigned_device_name(),
                                         &parsed)) {
@@ -847,7 +820,6 @@ Status Partition(const PartitionOptions& opts, Graph* g,
   string dstp;
   std::vector<const Edge*> inputs;
   DupRecvTable dup_recv(3);
-  DupControlTable dup_control(3);
   // For a node dst, 'ref_recvs' remembers the recvs introduced by a ref
   // edge to dst. 'ref_control_inputs' remembers the inputs by a non-ref
   // edge to dst. We will add a control edge for every pair in
@@ -857,9 +829,7 @@ Status Partition(const PartitionOptions& opts, Graph* g,
 
   int32 num_data = 0;
   int32 num_control = 0;
-  for (const Node* dst : g->nodes()) {
-    if (!dst->IsOp()) continue;  // Skip Sink/Source nodes.
-
+  for (const Node* dst : g->op_nodes()) {
     dstp = opts.node_to_loc(dst);
     GraphDef* dst_graph = &(*partitions)[dstp];
     NodeDef* dst_def = dst_graph->add_node();
@@ -929,11 +899,11 @@ Status Partition(const PartitionOptions& opts, Graph* g,
           send_start_time = opts.start_times[src->id()].value();
           recv_start_time = opts.start_times[dst->id()].value();
         } else {
-          status = GetNodeAttr(src->def(), "_start_time", &send_start_time);
+          status = GetNodeAttr(src->attrs(), "_start_time", &send_start_time);
           if (!status.ok()) {
             return status;
           }
-          status = GetNodeAttr(dst->def(), "_start_time", &recv_start_time);
+          status = GetNodeAttr(dst->attrs(), "_start_time", &recv_start_time);
           if (!status.ok()) {
             return status;
           }
@@ -941,9 +911,7 @@ Status Partition(const PartitionOptions& opts, Graph* g,
       }
 
       // Check whether there is already a send/recv pair transferring
-      // the same tensor/control from src to the dst partition. This
-      // handles the dedup case when a single source in one partition
-      // going to multiple destinations in another partition.
+      // the same tensor/control from the src to dst partition.
       const bool on_host = IsDstInputOnHost(edge, g_info);
       DupRecvKey key{src->id(), edge->src_output(), dst_graph, on_host};
       auto iter = dup_recv.find(key);
@@ -968,16 +936,6 @@ Status Partition(const PartitionOptions& opts, Graph* g,
 
       NodeDefBuilder::NodeOut send_from;
       if (edge->IsControlEdge()) {
-        // This handles the dedup case when multiple control edges going from
-        // one partition to a single destination in another partition.
-        DupControlKey key{dst->id(), src_graph};
-        auto iter = dup_control.find(key);
-        if (iter != dup_control.end()) {
-          // This could cause start_time(src) > start_time(iter->second).
-          AddInput(iter->second, src->name(), Graph::kControlSlot);
-          continue;
-        }
-
         // Insert a dummy const node that will generate a tiny
         // data element to be sent from send to recv.
         VLOG(1) << "Send/Recv control: " << src->assigned_device_name() << "["
@@ -991,7 +949,6 @@ Status Partition(const PartitionOptions& opts, Graph* g,
         }
         AddInput(dummy, src->name(), Graph::kControlSlot);
         send_from.Reset(dummy->name(), 0, DT_FLOAT);
-        dup_control[key] = dummy;
       } else {
         send_from.Reset(src->name(), edge->src_output(), EdgeType(edge));
       }
@@ -1067,9 +1024,10 @@ Status Partition(const PartitionOptions& opts, Graph* g,
     }
   }
 
-  // Set versions
+  // Set versions and function library
   for (auto& it : *partitions) {
     it.second.mutable_versions()->CopyFrom(g->versions());
+    *it.second.mutable_library() = g->flib_def().ToProto();
   }
 
   // Set the start times for recvs at the very end.

@@ -17,12 +17,26 @@ package org.tensorflow;
 
 /** Static utility methods describing the TensorFlow runtime. */
 public final class TensorFlow {
+  /** Returns the version of the underlying TensorFlow runtime. */
+  public static native String version();
+
+  /**
+   * All the TensorFlow operations available in this address space.
+   *
+   * @return A serialized representation of an <a
+   *     href="https://www.tensorflow.org/code/tensorflow/core/framework/op_def.proto">OpList</a>
+   *     protocol buffer, which lists all the available TensorFlow operations.
+   */
+  public static native byte[] registeredOpList();
+
   private TensorFlow() {}
 
-  static {
-    System.loadLibrary("tensorflow-jni");
+  /** Load the TensorFlow runtime C library. */
+  static void init() {
+    NativeLibrary.load();
   }
 
-  /** Returns the version of the underlying TensorFlow runtime. */
-  public static native String getVersion();
+  static {
+    init();
+  }
 }

@@ -41,10 +41,10 @@ Status GetAxisForPackAndUnpack(InferenceContext* c, int32 rank_after_pack,
 }
 
 template <typename T>
-std::vector<int64> AsInt64(const Tensor* tensor, int num_elements) {
+std::vector<int64> AsInt64(const Tensor* tensor, int64 num_elements) {
   std::vector<int64> ret(num_elements);
   auto data = tensor->vec<T>();
-  for (int i = 0; i < num_elements; ++i) {
+  for (int64 i = 0; i < num_elements; ++i) {
     ret[i] = data(i);
   }
   return ret;
@@ -52,11 +52,11 @@ std::vector<int64> AsInt64(const Tensor* tensor, int num_elements) {
 
 template <typename T>
 Status PadKnown(InferenceContext* c, ShapeHandle input,
-                const Tensor* paddings_t, int32 num_dims) {
+                const Tensor* paddings_t, int64 num_dims) {
   // paddings_t is known.
   std::vector<DimensionHandle> dims(num_dims);
   auto paddings_data = paddings_t->matrix<T>();
-  for (int i = 0; i < num_dims; ++i) {
+  for (int64 i = 0; i < num_dims; ++i) {
     const T pad0 = paddings_data(i, 0);
     const T pad1 = paddings_data(i, 1);
     if (pad0 < 0 || pad1 < 0) {
@@ -97,10 +97,9 @@ Status PadShapeFn(InferenceContext* c) {
     return Status::OK();
   }
 
-  // tensor value was provided for paddings_t; doublecheck n_dim value is the
-  // same.
-  const auto num_dims = c->Value(n_dim);
-  DCHECK_EQ(num_dims, paddings_t->shape().dim_size(0));
+  const int64 num_dims = paddings_t->shape().dim_size(0);
+  TF_RETURN_IF_ERROR(c->WithRank(input, num_dims, &input));
+  TF_RETURN_IF_ERROR(c->WithValue(n_dim, num_dims, &n_dim));
 
   if (paddings_t->dtype() == DT_INT32) {
     return PadKnown<int32>(c, input, paddings_t, num_dims);
@@ -165,6 +164,71 @@ Status SetOutputShapeForReshape(InferenceContext* c) {
 
 }  // namespace
 
+REGISTER_OP("ParallelConcat")
+    .Input("values: N * T")
+    .Output("output: T")
+    .Attr("N: int >= 1")
+    .Attr("T: type")
+    .Attr("shape: shape")
+    .SetShapeFn([](InferenceContext* c) {
+      // Validate that the shape attr is correct.
+      TensorShapeProto passed_shape_proto;
+      TF_RETURN_IF_ERROR(c->GetAttr("shape", &passed_shape_proto));
+      ShapeHandle passed_shape;
+      TF_RETURN_IF_ERROR(
+          c->MakeShapeFromShapeProto(passed_shape_proto, &passed_shape));
+      if (!c->FullyDefined(passed_shape)) {
+        return errors::InvalidArgument("shape attr must be fully defined.");
+      }
+      ShapeHandle cur;
+      TF_RETURN_IF_ERROR(c->ReplaceDim(
+          passed_shape, 0, c->MakeDim(shape_inference::DimensionOrConstant(1)),
+          &cur));
+      for (int i = 0; i < c->num_inputs(); ++i) {
+        if (!c->FullyDefined(c->input(i))) {
+          return errors::InvalidArgument(
+              "All input shapes must be fully defined.");
+        }
+        DimensionHandle unused;
+        if (!c->WithValue(c->Dim(c->input(i), 0), 1, &unused).ok()) {
+          return errors::InvalidArgument("Size of first dimension must be 1.");
+        }
+        TF_RETURN_WITH_CONTEXT_IF_ERROR(c->Merge(c->input(i), cur, &cur),
+                                        "From merging shape ", i,
+                                        " with other shapes.");
+      }
+
+      c->set_output(0, passed_shape);
+
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Concatenates a list of `N` tensors along the first dimension.
+
+The input tensors are all required to have size 1 in the first dimension.
+
+For example:
+
+```
+# 'x' is [[1, 4]]
+# 'y' is [[2, 5]]
+# 'z' is [[3, 6]]
+parallel_concat([x, y, z]) => [[1, 4], [2, 5], [3, 6]]  # Pack along first dim.
+```
+
+The difference between concat and parallel_concat is that concat requires all
+of the inputs be computed before the operation will begin but doesn't require
+that the input shapes be known during graph construction.  Parallel concat
+will copy pieces of the input into the output as they become available, in
+some situations this can provide a performance benefit.
+
+values: Tensors to be concatenated. All must have size 1 in the first dimension
+ and same shape.
+output: The concatenated tensor.
+shape: the final shape of the result; should be equal to the shapes of any input
+ but with the number of input values in the first dimension.
+)doc");
+
 REGISTER_OP("Pack")
     .Input("values: N * T")
     .Output("output: T")
@@ -213,7 +277,7 @@ Etc.
 
 For example:
 
-```prettyprint
+```
 # 'x' is [1, 4]
 # 'y' is [2, 5]
 # 'z' is [3, 6]
@@ -324,11 +388,33 @@ Concatenates tensors along one dimension.
 values: List of `N` Tensors to concatenate. Their ranks and types must match,
   and their sizes must match in all dimensions except `concat_dim`.
 axis: 0-D.  The dimension along which to concatenate.  Must be in the
-  range [0, rank(values)).
+  range [-rank(values), rank(values)).
 output: A `Tensor` with the concatenation of values stacked along the
   `concat_dim` dimension.  This tensor's shape matches that of `values` except
   in `concat_dim` where it has the sum of the sizes.
 )doc");
+
+// TODO(vivek.v.rane@intel.com): Prefix the op names with underscore if the ops
+// are not to be made user-accessible.
+#ifdef INTEL_MKL
+REGISTER_OP("_MklConcatV2")
+    .Input("values: N * T")
+    .Input("axis: Tidx")
+    .Input("mkl_values: N * uint8")
+    .Input("mkl_axis: uint8")
+    .Output("output: T")
+    .Output("mkl_output: uint8")
+    .Attr("N: int >= 2")
+    .Attr("T: type")
+    .Attr("Tidx: {int32, int64} = DT_INT32")
+    .SetShapeFn(shape_inference::ConcatV2Shape)
+    .Doc(R"doc(
+MKL version of ConcatV2 operator. Uses MKL DNN APIs to perform concatenation.
+
+NOTE Do not invoke this operator directly in Python. Graph rewrite pass is
+expected to invoke these operators.
+)doc");
+#endif
 
 REGISTER_OP("ConcatOffset")
     .Input("concat_dim: int32")
@@ -346,19 +432,19 @@ Computes offsets of concat inputs within its output.
 
 For example:
 
-```prettyprint
+```
 # 'x' is [2, 2, 7]
 # 'y' is [2, 3, 7]
 # 'z' is [2, 5, 7]
 concat_offset(2, [x, y, z]) => [0, 0, 0], [0, 2, 0], [0, 5, 0]
 ```
 
+This is typically used by gradient computations for a concat operation.
+
 concat_dim: The dimension along which to concatenate.
 shape: The `N` int32 vectors representing shape of tensors being concatenated.
 offset: The `N` int32 vectors representing the starting offset
         of input tensors within the concatenated output.
-
-This is typically used by gradient computations for a concat operation.
 )doc");
 
 // --------------------------------------------------------------------------
@@ -416,24 +502,86 @@ REGISTER_OP("SplitV")
     .Attr("T: type")
     .Attr("Tlen: {int32, int64} = DT_INT64")
     .SetShapeFn([](InferenceContext* c) {
-      ShapeHandle unused;
+      DimensionHandle split_dimension;
+      TF_RETURN_IF_ERROR(c->MakeDimForScalarInput(2, &split_dimension));
       int32 num_outputs = c->num_outputs();
-      // Return unknown shapes with the same rank as the input
-      // or unknown rank if input's rank isn't known
-      // can't determine exact shapes until runtime because
-      // we don't know where the tensor containing the split sizes
-      // is located
-      int32 rank = c->Rank(c->input(0));
+      ShapeHandle input = c->input(0);
+      int32 rank = c->Rank(input);
       ShapeHandle output_shape;
+      const Tensor* size_splits = c->input_tensor(1);
       if (rank == InferenceContext::kUnknownRank) {
+        // If the rank of input tensor is unknown, then return unknown shapes.
         output_shape = c->UnknownShape();
+        for (int i = 0; i < num_outputs; ++i) {
+          c->set_output(i, output_shape);
+        }
       } else if (rank == 0) {
+        // Throw error if input is a scalar.
         return errors::InvalidArgument("Can't split scalars");
-      } else {
+      } else if (size_splits == nullptr && c->ValueKnown(split_dimension)) {
+        // If split dimension is known, but the sizes are unknown, then
+        // only the split dimension is unknown
+        output_shape = input;
+        TF_RETURN_IF_ERROR(c->ReplaceDim(output_shape,
+                                         c->Value(split_dimension),
+                                         c->UnknownDim(), &output_shape));
+        for (int i = 0; i < num_outputs; ++i) {
+          c->set_output(i, output_shape);
+        }
+      } else if (size_splits == nullptr && !c->ValueKnown(split_dimension)) {
+        // If split dimension or tensor containing the split sizes is unknown,
+        // then return unknown shapes of same rank as input.
         output_shape = c->UnknownShapeOfRank(rank);
-      }
-      for (int i = 0; i < num_outputs; ++i) {
-        c->set_output(i, output_shape);
+        for (int i = 0; i < num_outputs; ++i) {
+          c->set_output(i, output_shape);
+        }
+      } else {
+        // Determine the output shape if split dimension and split sizes are
+        // known.
+        int64 split_dim = c->Value(split_dimension);
+        TF_RETURN_IF_ERROR(c->WithRankAtLeast(input, split_dim + 1, &input));
+        std::vector<int64> data;
+        if (size_splits->dtype() == DT_INT32) {
+          data = AsInt64<int32>(size_splits, size_splits->shape().dim_size(0));
+        } else {
+          data = AsInt64<int64>(size_splits, size_splits->shape().dim_size(0));
+        }
+        if (num_outputs != data.size()) {
+          return errors::InvalidArgument(
+              "Length of size_splits should be equal to num_outputs");
+        }
+        int64_t cumsum_outputs = 0;
+        bool has_neg_one = false;
+        // If the sizes of the splits are known, then
+        // make sure that the sizes add up to the expected
+        // dimension size, with the possibility of a -1.
+        // Specify the full output shapes.
+        for (int i = 0; i < num_outputs; ++i) {
+          output_shape = c->UnknownShapeOfRank(rank);
+          TF_RETURN_IF_ERROR(c->ReplaceDim(input, split_dim,
+                                           c->MakeDim(data[i]), &output_shape));
+          c->set_output(i, output_shape);
+          if (data[i] == -1 && !has_neg_one)
+            has_neg_one = true;
+          else if (data[i] == -1 && has_neg_one)
+            return errors::InvalidArgument("size_splits can only have one -1");
+          else
+            cumsum_outputs += data[i];
+        }
+        auto split_dim_size = c->Value(c->Dim(input, split_dim));
+        if (has_neg_one) {
+          if (cumsum_outputs < split_dim_size)
+            cumsum_outputs = split_dim_size;
+          else
+            cumsum_outputs = split_dim_size + 1;
+        }
+        if (c->ValueKnown(c->Dim(input, split_dim)) &&
+            cumsum_outputs != c->Value(c->Dim(input, split_dim)))
+          return errors::InvalidArgument(
+              "Sum of output sizes must match "
+              "the size of the original Tensor along the split dimension "
+              "or the sum of the positive sizes must be less if it contains a "
+              "-1");
       }
 
       return Status::OK();
@@ -519,6 +667,19 @@ y: a tensor of the same shape and type as x but filled with zeros.
 )doc");
 
 // --------------------------------------------------------------------------
+REGISTER_OP("OnesLike")
+    .Input("x: T")
+    .Output("y: T")
+    .Attr("T: {float, double, int32, int64, complex64, complex128}")
+    .SetShapeFn(shape_inference::UnchangedShape)
+    .Doc(R"doc(
+Returns a tensor of ones with the same shape and type as x.
+
+x: a tensor of type T.
+y: a tensor of the same shape and type as x but filled with ones.
+)doc");
+
+// --------------------------------------------------------------------------
 REGISTER_OP("Diag")
     .Input("diagonal: T")
     .Output("output: T")
@@ -545,7 +706,7 @@ rank 2k with dimensions [D1,..., Dk, D1,..., Dk] where:
 
 For example:
 
-```prettyprint
+```
 # 'diagonal' is [1, 2, 3, 4]
 tf.diag(diagonal) ==> [[1, 0, 0, 0]
                        [0, 2, 0, 0]
@@ -597,7 +758,7 @@ tensor of rank `k` with dimensions `[D1,..., Dk]` where:
 
 For example:
 
-```prettyprint
+```
 # 'input' is [[1, 0, 0, 0]
               [0, 2, 0, 0]
               [0, 0, 3, 0]
@@ -643,7 +804,7 @@ tensor of rank `k+1` with dimensions [I, J, K, ..., N, N]` where:
 
 For example:
 
-```prettyprint
+```
 # 'diagonal' is [[1, 2, 3, 4], [5, 6, 7, 8]]
 
 and diagonal.shape = (2, 4)
@@ -755,7 +916,7 @@ The input must be at least a matrix.
 
 For example:
 
-```prettyprint
+```
 # 'input' is [[[1, 0, 0, 0]
                [0, 2, 0, 0]
                [0, 0, 3, 0]
@@ -802,7 +963,7 @@ The indicator function
 
 For example:
 
-```prettyprint
+```
 # if 'input' is [[ 0,  1,  2, 3]
                  [-1,  0,  1, 2]
                  [-2, -1,  0, 1]
@@ -821,7 +982,7 @@ tf.matrix_band_part(input, 2, 1) ==> [[ 0,  1,  0, 0]
 
 Useful special cases:
 
-```prettyprint
+```
  tf.matrix_band_part(input, 0, -1) ==> Upper triangular part.
  tf.matrix_band_part(input, -1, 0) ==> Lower triangular part.
  tf.matrix_band_part(input, 0, 0) ==> Diagonal.
@@ -843,7 +1004,7 @@ REGISTER_OP("Reverse")
     .Output("output: T")
     .Attr(
         "T: {uint8, int8, int32, int64, bool, half, float, double, complex64, "
-        "complex128}")
+        "complex128, string}")
     .SetShapeFn([](InferenceContext* c) {
       ShapeHandle input = c->input(0);
       ShapeHandle dims;
@@ -873,7 +1034,7 @@ of `tensor` must equal the number of elements in `dims`. In other words:
 
 For example:
 
-```prettyprint
+```
 # tensor 't' is [[[[ 0,  1,  2,  3],
 #                  [ 4,  5,  6,  7],
 #                  [ 8,  9, 10, 11]],
@@ -920,7 +1081,7 @@ REGISTER_OP("ReverseV2")
     .Attr("Tidx: {int32, int64} = DT_INT32")
     .Attr(
         "T: {uint8, int8, int32, int64, bool, half, float, double, complex64, "
-        "complex128}")
+        "complex128, string}")
     .SetShapeFn([](InferenceContext* c) {
       ShapeHandle input = c->input(0);
       ShapeHandle axis;
@@ -936,6 +1097,9 @@ REGISTER_OP("ReverseV2")
     .Doc(R"Doc(
 Reverses specific dimensions of a tensor.
 
+NOTE `tf.reverse` has now changed behavior in preparation for 1.0.
+`tf.reverse_v2` is currently an alias that will be deprecated before TF 1.0.
+
 Given a `tensor`, and a `int32` tensor `axis` representing the set of
 dimensions of `tensor` to reverse. This operation reverses each dimension
 `i` for which there exists `j` s.t. `axis[j] == i`.
@@ -946,7 +1110,7 @@ once, a InvalidArgument error is raised.
 
 For example:
 
-```prettyprint
+```
 # tensor 't' is [[[[ 0,  1,  2,  3],
 #                  [ 4,  5,  6,  7],
 #                  [ 8,  9, 10, 11]],
@@ -1117,7 +1281,7 @@ This operation creates a tensor of shape `dims` and fills it with `value`.
 
 For example:
 
-```prettyprint
+```
 # Output tensor has shape [2, 3].
 fill([2, 3], 9) ==> [[9, 9, 9]
                      [9, 9, 9]]
@@ -1129,6 +1293,56 @@ value: 0-D (scalar). Value to fill the returned tensor.
 @compatibility(numpy)
 Equivalent to np.full
 @end_compatibility
+)doc");
+
+// --------------------------------------------------------------------------
+REGISTER_OP("_ParallelConcatStart")
+    .Output("output: dtype")
+    .Attr("shape: shape")
+    .Attr("dtype: type")
+    .SetIsStateful()
+    .SetShapeFn([](InferenceContext* c) {
+      TensorShapeProto shape_proto;
+      TF_RETURN_IF_ERROR(c->GetAttr("shape", &shape_proto));
+      ShapeHandle output_shape;
+      TF_RETURN_IF_ERROR(
+          c->MakeShapeFromShapeProto(shape_proto, &output_shape));
+      c->set_output(0, output_shape);
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Creates an empty Tensor with shape `shape` and type `dtype`.
+
+The memory can optionally be initialized. This is usually useful in
+conjunction with inplace operations.
+
+shape: 1-D `Tensor` indicating the shape of the output.
+dtype: The element type of the returned tensor.
+output: An empty Tensor of the specified type.
+)doc");
+
+// --------------------------------------------------------------------------
+REGISTER_OP("_ParallelConcatUpdate")
+    .Input("value: T")
+    .Input("update: T")
+    .Output("output: T")
+    .Attr("T: type")
+    .Attr("loc: int")
+    .SetShapeFn(shape_inference::UnchangedShape)
+    .Doc(R"doc(
+Updates input `value` at `loc` with `update`.
+
+If you use this function you will almost certainly want to add
+a control dependency as done in the implementation of parallel_stack to
+avoid race conditions.
+
+value: A `Tensor` object that will be updated in-place.
+loc: A scalar indicating the index of the first dimension such that
+         value[loc, :] is updated.
+update: A `Tensor` of rank one less than `value` if `loc` is a scalar,
+        otherwise of rank equal to `value` that contains the new values
+        for `value`.
+output: `value` that has been updated accordingly.
 )doc");
 
 // --------------------------------------------------------------------------
@@ -1170,8 +1384,13 @@ Produces an output tensor with shape `indices.shape + params.shape[1:]` where:
 If `indices` is a permutation and `len(indices) == params.shape[0]` then
 this operation will permute `params` accordingly.
 
+`validate_indices`: DEPRECATED. If this operation is assigned to CPU, values in
+`indices` are always validated to be within range. If assigned to GPU,
+out-of-bound indices result in safe but unspecified behavior, which may include
+raising an error.
+
 <div style="width:70%; margin:auto; margin-bottom:10px; margin-top:20px;">
-<img style="width:100%" src="../../images/Gather.png" alt>
+<img style="width:100%" src="https://www.tensorflow.org/images/Gather.png" alt>
 </div>
 )doc");
 
@@ -1196,8 +1415,8 @@ REGISTER_OP("GatherNd")
       if (c->Value(r_dim) > c->Rank(params)) {
         return errors::InvalidArgument(
             "indices.shape[-1] must be <= params.rank, but saw indices shape: ",
-            c->DebugString(indices), " and params shape: ",
-            c->DebugString(params));
+            c->DebugString(indices),
+            " and params shape: ", c->DebugString(params));
       }
 
       // Remove r_dim from indices to get output.
@@ -1213,20 +1432,17 @@ REGISTER_OP("GatherNd")
     .Doc(R"doc(
 Gather values or slices from `params` according to `indices`.
 
-`params` is a Tensor of rank `P` and `indices` is a Tensor of rank `Q`.
+`indices` is an integer tensor containing indices into `params`.  The last
+dimension of `indices` can be at most the rank of `params`:
 
-`indices` must be integer tensor, containing indices into `params`.
-It must be shape `[d_0, ..., d_{Q-2}, K]` where `0 < K <= P`.
+    indices.shape[-1] <= params.rank
 
-The innermost dimension of `indices` (with length `K`) corresponds to
-indices into elements (if `K = P`) or slices (if `K < P`) along the `K`th
-dimension of `params`.
+The last dimension of `indices` corresponds to elements
+(if `indices.shape[-1] = params.rank`) or slices
+(if `indices.shape[-1] < params.rank`) along dimension `indices.shape[-1]`
+of `params`.  The output tensor has shape
 
-Produces an output tensor with shape
-
-```
-[d_0, ..., d_{Q-2}, params.shape[K], ..., params.shape[P-1]].
-```
+    indices.shape[:-1] + params.shape[indices.shape[-1]:]
 
 Some examples below.
 
@@ -1305,10 +1521,10 @@ Batched indexing into a 3-tensor:
     output = [['b0', 'b1'], ['d0', 'c1']]
 ```
 
-params: `P-D`.  The tensor from which to gather values.
-indices: `Q-D`.  Index tensor having shape `[d_0, ..., d_{Q-2}, K]`.
-output: `(P+Q-K-1)-D`.  Values from `params` gathered from indices given by
-  `indices`.
+params: The tensor from which to gather values.
+indices: Index tensor.
+output: Values from `params` gathered from indices given by `indices`, with
+  shape `indices.shape[:-1] + params.shape[indices.shape[-1]:]`.
 )doc");
 
 // --------------------------------------------------------------------------
@@ -1318,13 +1534,34 @@ REGISTER_OP("Identity")
     .Attr("T: type")
     .SetShapeFn([](shape_inference::InferenceContext* c) {
       c->set_output(0, c->input(0));
-      c->set_output_handle_dtype(0, c->input_handle_dtype(0));
-      c->set_output_handle_shape(0, c->input_handle_shape(0));
+      auto* handle_data = c->input_handle_shapes_and_types(0);
+      if (handle_data != nullptr) {
+        c->set_output_handle_shapes_and_types(0, *handle_data);
+      }
       return Status::OK();
     })
     .Doc(R"Doc(
 Return a tensor with the same shape and contents as the input tensor or value.
 )Doc");
+
+#ifdef INTEL_MKL
+REGISTER_OP("_MklIdentity")
+    .Input("input: T")
+    .Input("mkl_input: uint8")
+    .Output("output: T")
+    .Output("mkl_output: uint8")
+    .Attr("T: type")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      c->set_output(0, c->input(0));
+      auto* handle_data = c->input_handle_shapes_and_types(0);
+      if (handle_data != nullptr) {
+        c->set_output_handle_shapes_and_types(0, *handle_data);
+      }
+      return Status::OK();
+    })
+    .Doc(R"Doc( Mkl implementation of IdentityOp
+)Doc");
+#endif
 
 // --------------------------------------------------------------------------
 REGISTER_OP("RefIdentity")
@@ -1367,6 +1604,29 @@ to pretend that the value was a constant. Some examples include:
    example generation process.
 )Doc");
 
+REGISTER_OP("PreventGradient")
+    .Input("input: T")
+    .Output("output: T")
+    .Attr("T: type")
+    .Attr("message: string = ''")
+    .SetShapeFn(shape_inference::UnchangedShape)
+    .Doc(R"Doc(
+An identity op that triggers an error if a gradient is requested.
+
+When executed in a graph, this op outputs its input tensor as-is.
+
+When building ops to compute gradients, the TensorFlow gradient system
+will return an error when trying to lookup the gradient of this op,
+because no gradient must ever be registered for this function.  This
+op exists to prevent subtle bugs from silently returning unimplemented
+gradients in some corner cases.
+
+input: any tensor.
+output: the same input tensor.
+message: Will be printed in the error when anyone tries to differentiate
+this operation.
+)Doc");
+
 // --------------------------------------------------------------------------
 REGISTER_OP("CheckNumerics")
     .Input("tensor: T")
@@ -1407,7 +1667,7 @@ implied by `shape` must be the same as the number of elements in `tensor`.
 
 For example:
 
-```prettyprint
+```
 # tensor 't' is [1, 2, 3, 4, 5, 6, 7, 8, 9]
 # tensor 't' has shape [9]
 reshape(t, [3, 3]) ==> [[1, 2, 3],
@@ -1454,6 +1714,21 @@ reshape(t, []) ==> 7
 shape: Defines the shape of the output tensor.
 )Doc");
 
+#ifdef INTEL_MKL
+REGISTER_OP("_MklReshape")
+    .Input("tensor: T")
+    .Input("shape: Tshape")
+    .Input("mkl_tensor: uint8")
+    .Input("mkl_shape: uint8")
+    .Output("output: T")
+    .Output("mkl_output: uint8")
+    .Attr("T: type")
+    .Attr("Tshape: {int32, int64} = DT_INT32")
+    .SetShapeFn([](InferenceContext* c) { return SetOutputShapeForReshape(c); })
+    .Doc(R"Doc( MKL implementation of ReshapeOp.
+)Doc");
+#endif  // INTEL_MKL
+
 // --------------------------------------------------------------------------
 REGISTER_OP("InvertPermutation")
     .Input("x: T")
@@ -1479,7 +1754,7 @@ The values must include 0. There can be no duplicate values or negative values.
 
 For example:
 
-```prettyprint
+```
 # tensor `x` is [3, 4, 0, 2, 1]
 invert_permutation(x) ==> [2, 4, 3, 0, 1]
 ```
@@ -1584,7 +1859,7 @@ in the unique output `y`. In other words:
 
 For example:
 
-```prettyprint
+```
 # tensor 'x' is [1, 1, 2, 4, 4, 4, 7, 8, 8]
 y, idx = unique(x)
 y ==> [1, 2, 4, 7, 8]
@@ -1624,7 +1899,7 @@ contains the count of each element of `y` in `x`. In other words:
 
 For example:
 
-```prettyprint
+```
 # tensor 'x' is [1, 1, 2, 4, 4, 4, 7, 8, 8]
 y, idx, count = unique_with_counts(x)
 y ==> [1, 2, 4, 7, 8]
@@ -1669,7 +1944,7 @@ This operation returns a 1-D integer tensor representing the shape of `input`.
 
 For example:
 
-```prettyprint
+```
 # 't' is [[[1, 1, 1], [2, 2, 2]], [[3, 3, 3], [4, 4, 4]]]
 shape(t) ==> [2, 2, 3]
 ```
@@ -1715,12 +1990,12 @@ REGISTER_OP("ReverseSequence")
       // Validate batch_dim and seq_dim against input.
       const int32 input_rank = c->Rank(input);
       if (batch_dim >= input_rank) {
-        return errors::InvalidArgument("batch_dim must be < input rank: ",
-                                       batch_dim, " vs. ", input_rank);
+        return errors::InvalidArgument(
+            "batch_dim must be < input rank: ", batch_dim, " vs. ", input_rank);
       }
       if (seq_dim >= input_rank) {
-        return errors::InvalidArgument("seq_dim must be < input rank: ",
-                                       seq_dim, " vs. ", input_rank);
+        return errors::InvalidArgument(
+            "seq_dim must be < input rank: ", seq_dim, " vs. ", input_rank);
       }
 
       DimensionHandle batch_dim_dim = c->Dim(input, batch_dim);
@@ -1741,7 +2016,7 @@ This op first slices `input` along the dimension `batch_dim`, and for each
 slice `i`, reverses the first `seq_lengths[i]` elements along
 the dimension `seq_dim`.
 
-The elements of `seq_lengths` must obey `seq_lengths[i] < input.dims[seq_dim]`,
+The elements of `seq_lengths` must obey `seq_lengths[i] <= input.dims[seq_dim]`,
 and `seq_lengths` must be a vector of length `input.dims[batch_dim]`.
 
 The output slice `i` along dimension `batch_dim` is then given by input
@@ -1750,7 +2025,7 @@ slice `i`, with the first `seq_lengths[i]` slices along dimension
 
 For example:
 
-```prettyprint
+```
 # Given this:
 batch_dim = 0
 seq_dim = 1
@@ -1772,7 +2047,7 @@ output[3, 2:, :, ...] = input[3, 2:, :, ...]
 
 In contrast, if:
 
-```prettyprint
+```
 # Given this:
 batch_dim = 2
 seq_dim = 0
@@ -1794,7 +2069,7 @@ output[2:, :, 3, :, ...] = input[2:, :, 3, :, ...]
 
 input: The input to reverse.
 seq_lengths: 1-D with length `input.dims(batch_dim)` and
-  `max(seq_lengths) < input.dims(seq_dim)`
+  `max(seq_lengths) <= input.dims(seq_dim)`
 seq_dim: The dimension which is partially reversed.
 batch_dim: The dimension along which reversal is performed.
 output: The partially reversed input. It has the same shape as `input`.
@@ -1813,7 +2088,7 @@ This operation returns an integer representing the rank of `input`.
 
 For example:
 
-```prettyprint
+```
 # 't' is [[[1, 1, 1], [2, 2, 2]], [[3, 3, 3], [4, 4, 4]]]
 # shape of tensor 't' is [2, 2, 3]
 rank(t) ==> 3
@@ -1839,7 +2114,7 @@ This operation returns an integer representing the number of elements in
 
 For example:
 
-```prettyprint
+```
 # 't' is [[[1, 1,, 1], [2, 2, 2]], [[3, 3, 3], [4, 4, 4]]]]
 size(t) ==> 12
 ```
@@ -2072,7 +2347,7 @@ encoding is best understand by considering a non-trivial example. In
 particular,
 `foo[1, 2:4, None, ..., :-3:-1, :]` will be encoded as
 
-```prettyprint
+```
 begin = [1, 2, x, x, 0, x] # x denotes don't care (usually 0)
 end = [2, 4, x, x, -3, x]
 strides = [1, 1, x, x, -1, 1]
@@ -2214,6 +2489,32 @@ shape must be exactly the shape produced by the slice of `ref`.
 // broadcasting.
 // --------------------------------------------------------------------------
 
+REGISTER_OP("ResourceStridedSliceAssign")
+    .Input("ref: resource")
+    .Input("begin: Index")
+    .Input("end: Index")
+    .Input("strides: Index")
+    .Input("value: T")
+    .Attr("T: type")
+    .Attr("Index: {int32, int64}")
+    .Attr("begin_mask: int = 0")
+    .Attr("end_mask: int = 0")
+    .Attr("ellipsis_mask: int = 0")
+    .Attr("new_axis_mask: int = 0")
+    .Attr("shrink_axis_mask: int = 0")
+    .SetShapeFn(shape_inference::NoOutputs)
+    .Doc(R"doc(
+Assign `value` to the sliced l-value reference of `ref`.
+
+The values of `value` are assigned to the positions in the variable
+`ref` that are selected by the slice parameters. The slice parameters
+`begin, `end`, `strides`, etc. work exactly as in `StridedSlice`.
+
+NOTE this op currently does not support broadcasting and so `value`'s
+shape must be exactly the shape produced by the slice of `ref`.
+
+)doc");
+
 REGISTER_OP("Tile")
     .Input("input: T")
     .Input("multiples: Tmultiples")
@@ -2294,7 +2595,7 @@ the output tensor can vary depending on how many true values there are in
 
 For example:
 
-```prettyprint
+```
 # 'input' tensor is [[True, False]
 #                    [True, False]]
 # 'input' has two true values, so output has two coordinates.
@@ -2317,6 +2618,39 @@ where(input) ==> [[0, 0, 0],
                   [2, 1, 1]]
 ```
 
+)doc");
+
+// --------------------------------------------------------------------------
+REGISTER_OP("BroadcastArgs")
+    .Input("s0: T")
+    .Input("s1: T")
+    .Output("r0: T")
+    .Attr("T: {int32, int64} = DT_INT32")
+    .SetShapeFn([](InferenceContext* c) {
+      ShapeHandle unused;
+      ShapeHandle shape_x = c->input(0);
+      ShapeHandle shape_y = c->input(1);
+      TF_RETURN_IF_ERROR(c->WithRank(shape_x, 1, &unused));
+      TF_RETURN_IF_ERROR(c->WithRank(shape_y, 1, &unused));
+
+      if (!c->ValueKnown(c->Dim(shape_x, 0)) ||
+          !c->ValueKnown(c->Dim(shape_y, 0))) {
+        c->set_output(0, c->Vector(InferenceContext::kUnknownDim));
+        return Status::OK();
+      }
+
+      int64 x_dim = c->Value(c->Dim(shape_x, 0));
+      int64 y_dim = c->Value(c->Dim(shape_y, 0));
+
+      // Broadcasted shape is going to be as large as the largest dimension.
+      c->set_output(0, c->Vector(std::max(x_dim, y_dim)));
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Return the shape of s0 op s1 with broadcast.
+
+Given `s0` and `s1`, tensors that represent shapes, compute `r0`, the
+broadcasted shape. `s0`, `s1` and `r0` are all integer vectors.
 )doc");
 
 // --------------------------------------------------------------------------
@@ -2365,7 +2699,7 @@ The padded size of each dimension D of the output is:
 
 For example:
 
-```prettyprint
+```
 # 't' is [[1, 1], [2, 2]]
 # 'paddings' is [[1, 1], [2, 2]]
 # rank of 't' is 2
@@ -2404,7 +2738,7 @@ The padded size of each dimension D of the output is:
 
 For example:
 
-```prettyprint
+```
 # 't' is [[1, 2, 3], [4, 5, 6]].
 # 'paddings' is [[1, 1]], [2, 2]].
 # 'mode' is SYMMETRIC.
@@ -2430,10 +2764,10 @@ output: The padded tensor.
 namespace {
 template <typename T>
 Status MirrorPadKnown(InferenceContext* c, ShapeHandle input,
-                      const Tensor* paddings_t, int32 input_rank) {
+                      const Tensor* paddings_t, int64 input_rank) {
   auto paddings_data = paddings_t->matrix<T>();
   std::vector<DimensionHandle> dims(input_rank);
-  for (int i = 0; i < input_rank; ++i) {
+  for (int64 i = 0; i < input_rank; ++i) {
     const int64 pad0 = static_cast<int64>(paddings_data(i, 0));
     const int64 pad1 = static_cast<int64>(paddings_data(i, 1));
     if (pad0 < 0 || pad1 < 0) {
@@ -2500,7 +2834,7 @@ The folded size of each dimension D of the output is:
 
 For example:
 
-```prettyprint
+```
 # 't' is [[1, 2, 3], [4, 5, 6], [7, 8, 9]].
 # 'paddings' is [[0, 1]], [0, 1]].
 # 'mode' is SYMMETRIC.
@@ -2520,7 +2854,7 @@ output: The folded tensor.
 REGISTER_OP("Placeholder")
     .Output("output: dtype")
     .Attr("dtype: type")
-    .Attr("shape: shape = {}")
+    .Attr("shape: shape = { unknown_rank: true }")
     .SetShapeFn([](InferenceContext* c) {
       PartialTensorShape shape;
       TF_RETURN_IF_ERROR(c->GetAttr("shape", &shape));
@@ -2528,7 +2862,7 @@ REGISTER_OP("Placeholder")
       // Placeholder has legacy behavior where we cannot tell the difference
       // between a scalar shape attribute and 'unknown shape'.  So if the shape
       // is a scalar, we return an unknown shape.
-      if (shape.dims() <= 0) {
+      if (c->graph_def_version() <= 21 && shape.dims() <= 0) {
         return shape_inference::UnknownShape(c);
       }
 
@@ -2552,11 +2886,9 @@ shape: (Optional) The shape of the tensor. If the shape has 0 dimensions, the
   shape is unconstrained.
 )doc");
 
-// This version fixes an issue with the original version of Placeholder
-// where the empty shape attribute "[]" was used to denote
-// an unknown shape.  This meant that scalars (added later) could
-// not be represented natively.  This new version fixes that
-// limitation.
+// Placeholder was modified in a backwards compatible way to do what
+// PlaceholderV2 did, so we have deprecated V2 (no one was really
+// using it).
 REGISTER_OP("PlaceholderV2")
     .Output("output: dtype")
     .Attr("dtype: type")
@@ -2569,6 +2901,7 @@ REGISTER_OP("PlaceholderV2")
       c->set_output(0, output);
       return Status::OK();
     })
+    .Deprecated(23, "Placeholder now behaves the same as PlaceholderV2.")
     .Doc(R"doc(
 A placeholder op for a value that will be fed into the computation.
 
@@ -2605,7 +2938,7 @@ REGISTER_OP("PlaceholderWithDefault")
       return Status::OK();
     })
     .Doc(R"doc(
-A placeholder op that passes though `input` when its output is not fed.
+A placeholder op that passes through `input` when its output is not fed.
 
 input: The default value to produce when `output` is not fed.
 output: A placeholder tensor that defaults to `input` if it is not fed.
@@ -2677,7 +3010,7 @@ which will make the shape `[1, height, width, channels]`.
 
 Other examples:
 
-```prettyprint
+```
 # 't' is a tensor of shape [2]
 shape(expand_dims(t, 0)) ==> [1, 2]
 shape(expand_dims(t, 1)) ==> [2, 1]
@@ -2779,14 +3112,14 @@ dimensions, you can remove specific size 1 dimensions by specifying
 
 For example:
 
-```prettyprint
+```
 # 't' is a tensor of shape [1, 2, 1, 3, 1, 1]
 shape(squeeze(t)) ==> [2, 3]
 ```
 
 Or, to remove specific size 1 dimensions:
 
-```prettyprint
+```
 # 't' is a tensor of shape [1, 2, 1, 3, 1, 1]
 shape(squeeze(t, [2, 4])) ==> [1, 2, 3, 1]
 ```
@@ -2829,14 +3162,14 @@ position of each `out` element in `x`. In other words:
 
 For example, given this input:
 
-```prettyprint
+```
 x = [1, 2, 3, 4, 5, 6]
 y = [1, 3, 5]
 ```
 
 This operation would return:
 
-```prettyprint
+```
 out ==> [2, 4, 6]
 idx ==> [1, 3, 5]
 ```
@@ -3095,34 +3428,34 @@ Some examples:
 (1) For the following input of shape `[1, 2, 2, 1]`, `block_shape = [2, 2]`, and
     `paddings = [[0, 0], [0, 0]]`:
 
-```prettyprint
+```
 x = [[[[1], [2]], [[3], [4]]]]
 ```
 
 The output tensor has shape `[4, 1, 1, 1]` and value:
 
-```prettyprint
+```
 [[[[1]]], [[[2]]], [[[3]]], [[[4]]]]
 ```
 
 (2) For the following input of shape `[1, 2, 2, 3]`, `block_shape = [2, 2]`, and
     `paddings = [[0, 0], [0, 0]]`:
 
-```prettyprint
+```
 x = [[[[1, 2, 3], [4, 5, 6]],
       [[7, 8, 9], [10, 11, 12]]]]
 ```
 
 The output tensor has shape `[4, 1, 1, 3]` and value:
 
-```prettyprint
+```
 [[[1, 2, 3]], [[4, 5, 6]], [[7, 8, 9]], [[10, 11, 12]]]
 ```
 
 (3) For the following input of shape `[1, 4, 4, 1]`, `block_shape = [2, 2]`, and
     `paddings = [[0, 0], [0, 0]]`:
 
-```prettyprint
+```
 x = [[[[1],   [2],  [3],  [4]],
       [[5],   [6],  [7],  [8]],
       [[9],  [10], [11],  [12]],
@@ -3131,8 +3464,8 @@ x = [[[[1],   [2],  [3],  [4]],
 
 The output tensor has shape `[4, 2, 2, 1]` and value:
 
-```prettyprint
-x = [[[[1], [3]], [[5], [7]]],
+```
+x = [[[[1], [3]], [[9], [11]]],
      [[[2], [4]], [[10], [12]]],
      [[[5], [7]], [[13], [15]]],
      [[[6], [8]], [[14], [16]]]]
@@ -3141,7 +3474,7 @@ x = [[[[1], [3]], [[5], [7]]],
 (4) For the following input of shape `[2, 2, 4, 1]`, block_shape = `[2, 2]`, and
     paddings = `[[0, 0], [2, 0]]`:
 
-```prettyprint
+```
 x = [[[[1],   [2],  [3],  [4]],
       [[5],   [6],  [7],  [8]]],
      [[[9],  [10], [11],  [12]],
@@ -3150,7 +3483,7 @@ x = [[[[1],   [2],  [3],  [4]],
 
 The output tensor has shape `[8, 1, 3, 1]` and value:
 
-```prettyprint
+```
 x = [[[[0], [1], [3]]], [[[0], [9], [11]]],
      [[[0], [2], [4]]], [[[0], [10], [12]]],
      [[[0], [5], [7]]], [[[0], [13], [15]]],
@@ -3224,32 +3557,32 @@ Some examples:
 
 (1) For the following input of shape `[1, 2, 2, 1]` and block_size of 2:
 
-```prettyprint
+```
 x = [[[[1], [2]], [[3], [4]]]]
 ```
 
 The output tensor has shape `[4, 1, 1, 1]` and value:
 
-```prettyprint
+```
 [[[[1]]], [[[2]]], [[[3]]], [[[4]]]]
 ```
 
 (2) For the following input of shape `[1, 2, 2, 3]` and block_size of 2:
 
-```prettyprint
+```
 x = [[[[1, 2, 3], [4, 5, 6]],
       [[7, 8, 9], [10, 11, 12]]]]
 ```
 
 The output tensor has shape `[4, 1, 1, 3]` and value:
 
-```prettyprint
+```
 [[[1, 2, 3]], [[4, 5, 6]], [[7, 8, 9]], [[10, 11, 12]]]
 ```
 
 (3) For the following input of shape `[1, 4, 4, 1]` and block_size of 2:
 
-```prettyprint
+```
 x = [[[[1],   [2],  [3],  [4]],
       [[5],   [6],  [7],  [8]],
       [[9],  [10], [11],  [12]],
@@ -3258,8 +3591,8 @@ x = [[[[1],   [2],  [3],  [4]],
 
 The output tensor has shape `[4, 2, 2, 1]` and value:
 
-```prettyprint
-x = [[[[1], [3]], [[5], [7]]],
+```
+x = [[[[1], [3]], [[9], [11]]],
      [[[2], [4]], [[10], [12]]],
      [[[5], [7]], [[13], [15]]],
      [[[6], [8]], [[14], [16]]]]
@@ -3267,7 +3600,7 @@ x = [[[[1], [3]], [[5], [7]]],
 
 (4) For the following input of shape `[2, 2, 4, 1]` and block_size of 2:
 
-```prettyprint
+```
 x = [[[[1],   [2],  [3],  [4]],
       [[5],   [6],  [7],  [8]]],
      [[[9],  [10], [11],  [12]],
@@ -3276,7 +3609,7 @@ x = [[[[1],   [2],  [3],  [4]],
 
 The output tensor has shape `[8, 1, 2, 1]` and value:
 
-```prettyprint
+```
 x = [[[[1], [3]]], [[[9], [11]]], [[[2], [4]]], [[[10], [12]]],
      [[[5], [7]]], [[[13], [15]]], [[[6], [8]]], [[[14], [16]]]]
 ```
@@ -3362,26 +3695,26 @@ Some examples:
 (1) For the following input of shape `[4, 1, 1, 1]`, `block_shape = [2, 2]`, and
     `crops = [[0, 0], [0, 0]]`:
 
-```prettyprint
+```
 [[[[1]]], [[[2]]], [[[3]]], [[[4]]]]
 ```
 
 The output tensor has shape `[1, 2, 2, 1]` and value:
 
-```prettyprint
+```
 x = [[[[1], [2]], [[3], [4]]]]
 ```
 
 (2) For the following input of shape `[4, 1, 1, 3]`, `block_shape = [2, 2]`, and
     `crops = [[0, 0], [0, 0]]`:
 
-```prettyprint
+```
 [[[1, 2, 3]], [[4, 5, 6]], [[7, 8, 9]], [[10, 11, 12]]]
 ```
 
 The output tensor has shape `[1, 2, 2, 3]` and value:
 
-```prettyprint
+```
 x = [[[[1, 2, 3], [4, 5, 6]],
       [[7, 8, 9], [10, 11, 12]]]]
 ```
@@ -3389,8 +3722,8 @@ x = [[[[1, 2, 3], [4, 5, 6]],
 (3) For the following input of shape `[4, 2, 2, 1]`, `block_shape = [2, 2]`, and
     `crops = [[0, 0], [0, 0]]`:
 
-```prettyprint
-x = [[[[1], [3]], [[5], [7]]],
+```
+x = [[[[1], [3]], [[9], [11]]],
      [[[2], [4]], [[10], [12]]],
      [[[5], [7]], [[13], [15]]],
      [[[6], [8]], [[14], [16]]]]
@@ -3398,7 +3731,7 @@ x = [[[[1], [3]], [[5], [7]]],
 
 The output tensor has shape `[1, 4, 4, 1]` and value:
 
-```prettyprint
+```
 x = [[[1],   [2],  [3],  [4]],
      [[5],   [6],  [7],  [8]],
      [[9],  [10], [11],  [12]],
@@ -3408,7 +3741,7 @@ x = [[[1],   [2],  [3],  [4]],
 (4) For the following input of shape `[8, 1, 3, 1]`, `block_shape = [2, 2]`, and
     `crops = [[0, 0], [2, 0]]`:
 
-```prettyprint
+```
 x = [[[[0], [1], [3]]], [[[0], [9], [11]]],
      [[[0], [2], [4]]], [[[0], [10], [12]]],
      [[[0], [5], [7]]], [[[0], [13], [15]]],
@@ -3417,7 +3750,7 @@ x = [[[[0], [1], [3]]], [[[0], [9], [11]]],
 
 The output tensor has shape `[2, 2, 4, 1]` and value:
 
-```prettyprint
+```
 x = [[[[1],   [2],  [3],  [4]],
       [[5],   [6],  [7],  [8]]],
      [[[9],  [10], [11],  [12]],
@@ -3482,33 +3815,33 @@ Some examples:
 
 (1) For the following input of shape `[4, 1, 1, 1]` and block_size of 2:
 
-```prettyprint
+```
 [[[[1]]], [[[2]]], [[[3]]], [[[4]]]]
 ```
 
 The output tensor has shape `[1, 2, 2, 1]` and value:
 
-```prettyprint
+```
 x = [[[[1], [2]], [[3], [4]]]]
 ```
 
 (2) For the following input of shape `[4, 1, 1, 3]` and block_size of 2:
 
-```prettyprint
+```
 [[[1, 2, 3]], [[4, 5, 6]], [[7, 8, 9]], [[10, 11, 12]]]
 ```
 
 The output tensor has shape `[1, 2, 2, 3]` and value:
 
-```prettyprint
+```
 x = [[[[1, 2, 3], [4, 5, 6]],
       [[7, 8, 9], [10, 11, 12]]]]
 ```
 
 (3) For the following input of shape `[4, 2, 2, 1]` and block_size of 2:
 
-```prettyprint
-x = [[[[1], [3]], [[5], [7]]],
+```
+x = [[[[1], [3]], [[9], [11]]],
      [[[2], [4]], [[10], [12]]],
      [[[5], [7]], [[13], [15]]],
      [[[6], [8]], [[14], [16]]]]
@@ -3516,7 +3849,7 @@ x = [[[[1], [3]], [[5], [7]]],
 
 The output tensor has shape `[1, 4, 4, 1]` and value:
 
-```prettyprint
+```
 x = [[[1],   [2],  [3],  [4]],
      [[5],   [6],  [7],  [8]],
      [[9],  [10], [11],  [12]],
@@ -3525,14 +3858,14 @@ x = [[[1],   [2],  [3],  [4]],
 
 (4) For the following input of shape `[8, 1, 2, 1]` and block_size of 2:
 
-```prettyprint
+```
 x = [[[[1], [3]]], [[[9], [11]]], [[[2], [4]]], [[[10], [12]]],
      [[[5], [7]]], [[[13], [15]]], [[[6], [8]]], [[[14], [16]]]]
 ```
 
 The output tensor has shape `[2, 2, 4, 1]` and value:
 
-```prettyprint
+```
 x = [[[[1], [3]], [[5], [7]]],
      [[[2], [4]], [[10], [12]]],
      [[[5], [7]], [[13], [15]]],
@@ -3566,8 +3899,9 @@ REGISTER_OP("SpaceToDepth")
       TF_RETURN_IF_ERROR(c->Multiply(c->Dim(input, 3), block_size * block_size,
                                      &output_depth));
 
-      c->set_output(0, c->MakeShape({c->Dim(input, 0), output_height,
-                                     output_width, output_depth}));
+      c->set_output(0,
+                    c->MakeShape({c->Dim(input, 0), output_height, output_width,
+                                  output_depth}));
       return Status::OK();
     })
     .Doc(R"doc(
@@ -3597,14 +3931,14 @@ purely convolutional models.
 
 For example, given this input of shape `[1, 2, 2, 1]`, and block_size of 2:
 
-```prettyprint
+```
 x = [[[[1], [2]],
       [[3], [4]]]]
 ```
 
 This operation will output a tensor of shape `[1, 1, 1, 4]`:
 
-```prettyprint
+```
 [[[[1, 2, 3, 4]]]]
 ```
 
@@ -3615,7 +3949,7 @@ The output element shape is `[1, 1, 4]`.
 
 For an input tensor with larger depth, here of shape `[1, 2, 2, 3]`, e.g.
 
-```prettyprint
+```
 x = [[[[1, 2, 3], [4, 5, 6]],
       [[7, 8, 9], [10, 11, 12]]]]
 ```
@@ -3623,13 +3957,13 @@ x = [[[[1, 2, 3], [4, 5, 6]],
 This operation, for block_size of 2, will return the following tensor of shape
 `[1, 1, 1, 12]`
 
-```prettyprint
+```
 [[[[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]]]]
 ```
 
 Similarly, for the following input of shape `[1 4 4 1]`, and a block size of 2:
 
-```prettyprint
+```
 x = [[[[1],   [2],  [5],  [6]],
       [[3],   [4],  [7],  [8]],
       [[9],  [10], [13],  [14]],
@@ -3638,7 +3972,7 @@ x = [[[[1],   [2],  [5],  [6]],
 
 the operator will return the following tensor of shape `[1 2 2 4]`:
 
-```prettyprint
+```
 x = [[[[1, 2, 3, 4],
        [5, 6, 7, 8]],
       [[9, 10, 11, 12],
@@ -3671,8 +4005,9 @@ REGISTER_OP("DepthToSpace")
       TF_RETURN_IF_ERROR(c->Divide(c->Dim(input, 3), block_size * block_size,
                                    true /* evenly_divisible */, &output_depth));
 
-      c->set_output(0, c->MakeShape({c->Dim(input, 0), output_height,
-                                     output_width, output_depth}));
+      c->set_output(0,
+                    c->MakeShape({c->Dim(input, 0), output_height, output_width,
+                                  output_depth}));
       return Status::OK();
     })
     .Doc(R"doc(
@@ -3706,14 +4041,14 @@ purely convolutional models.
 
 For example, given this input of shape `[1, 1, 1, 4]`, and a block size of 2:
 
-```prettyprint
+```
 x = [[[[1, 2, 3, 4]]]]
 
 ```
 
 This operation will output a tensor of shape `[1, 2, 2, 1]`:
 
-```prettyprint
+```
    [[[[1], [2]],
      [[3], [4]]]]
 ```
@@ -3725,14 +4060,14 @@ The output element shape is `[2, 2, 1]`.
 
 For an input tensor with larger depth, here of shape `[1, 1, 1, 12]`, e.g.
 
-```prettyprint
+```
 x = [[[[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]]]]
 ```
 
 This operation, for block size of 2, will return the following tensor of shape
 `[1, 2, 2, 3]`
 
-```prettyprint
+```
    [[[[1, 2, 3], [4, 5, 6]],
      [[7, 8, 9], [10, 11, 12]]]]
 
@@ -3740,7 +4075,7 @@ This operation, for block size of 2, will return the following tensor of shape
 
 Similarly, for the following input of shape `[1 2 2 4]`, and a block size of 2:
 
-```prettyprint
+```
 x =  [[[[1, 2, 3, 4],
        [5, 6, 7, 8]],
       [[9, 10, 11, 12],
@@ -3749,7 +4084,7 @@ x =  [[[[1, 2, 3, 4],
 
 the operator will return the following tensor of shape `[1 4 4 1]`:
 
-```prettyprint
+```
 x = [[ [1],   [2],  [5],  [6]],
      [ [3],   [4],  [7],  [8]],
      [ [9],  [10], [13],  [14]],
@@ -4091,6 +4426,27 @@ REGISTER_OP("QuantizeAndDequantize")
     .Output("output: T")
     .Attr("T: {float, double}")
     .SetShapeFn(shape_inference::UnchangedShape)
+    .Deprecated(22, "Replaced by QuantizeAndDequantizeV2")
+    .Doc(R"doc(
+Use QuantizeAndDequantizeV2 instead.
+)doc");
+
+REGISTER_OP("QuantizeAndDequantizeV2")
+    .Input("input: T")
+    .Input("input_min: T")
+    .Input("input_max: T")
+    .Attr("signed_input: bool = true")
+    .Attr("num_bits: int = 8")
+    .Attr("range_given: bool = false")
+    .Output("output: T")
+    .Attr("T: {float, double}")
+    .SetShapeFn([](InferenceContext* c) {
+      ShapeHandle unused;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 0, &unused));
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 0, &unused));
+      c->set_output(0, c->input(0));
+      return Status::OK();
+    })
     .Doc(R"doc(
 Quantizes then dequantizes a tensor.
 
@@ -4109,7 +4465,7 @@ To perform this op, we first find the range of values in our tensor. The range
 we use is always centered on 0, so we find m such that
 
 1. m = max(abs(input_min), abs(input_max)) if range_given is true,
-2. m = max(max(abs(min_elem(input)), abs(max_elem(input))) otherwise.
+2. m = max(abs(min_elem(input)), abs(max_elem(input))) otherwise.
 
 Our input tensor range is then [-m, m].
 
@@ -4148,85 +4504,10 @@ input: Tensor to quantize and then dequantize.
 signed_input: If the quantization is signed or unsigned.
 num_bits: The bitwidth of the quantization.
 range_given: If the range is given or should be computed from the tensor.
-input_min: If range is given, this is the min of the range.
-input_max: If range is given, this is the max of the range.
-)doc");
-
-// EXPERIMENTAL: tfdbg debugger-inserted ops.
-REGISTER_OP("Copy")
-    .Input("input: T")
-    .Output("output: T")
-    .Attr("T: type")
-    .Attr("tensor_name: string = ''")
-    .SetAllowsUninitializedInput()
-    .Doc(R"doc(
-Copy Op.
-
-Performs CPU-to-CPU or GPU-to-GPU deep-copying of tensor, depending on the
-device on which the tensor is allocated.
-
-Unlike the CopyHost Op, this op does not have HostMemory constraint on its
-input or output.
-
-input: Input tensor.
-output: Output tensor, deep-copied from input.
-tensor_name: The name of the input tensor.
-)doc");
-
-REGISTER_OP("CopyHost")
-    .Input("input: T")
-    .Output("output: T")
-    .Attr("T: type")
-    .Attr("tensor_name: string = ''")
-    .SetAllowsUninitializedInput()
-    .Doc(R"doc(
-Copy Host Op.
-
-Performs CPU-to-CPU deep-copying of tensor.
-
-Unlike the Copy Op, this op has HostMemory constraint on its input or output.
-
-input: Input tensor.
-output: Output tensor, deep-copied from input.
-tensor_name: The name of the input tensor.
-)doc");
-
-REGISTER_OP("DebugIdentity")
-    .Input("input: T")
-    .Output("output: T")
-    .Attr("T: type")
-    .Attr("tensor_name: string = ''")
-    .Attr("debug_urls: list(string) = []")
-    .SetAllowsUninitializedInput()
-    .Doc(R"doc(
-Debug Identity Op.
-
-Provides an identity mapping of the non-Ref type input tensor for debugging.
-
-input: Input tensor, non-Reference type.
-output: Output tensor that equals the input tensor.
-tensor_name: Name of the input tensor.
-debug_urls: List of URLs to debug targets, e.g.,
-            file:///foo/tfdbg_dump, grpc:://localhost:11011
-)doc");
-
-REGISTER_OP("DebugNanCount")
-    .Input("input: T")
-    .Output("output: int64")  // The debug signal (nan count) is int64
-    .Attr("T: type")
-    .Attr("tensor_name: string = ''")
-    .Attr("debug_urls: list(string) = []")
-    .SetAllowsUninitializedInput()
-    .Doc(R"doc(
-Debug NaN Value Counter Op
-
-Counts number of NaNs in the input tensor, for debugging.
-
-input: Input tensor, non-Reference type.
-output: An integer output tensor that is the number of NaNs in the input.
-tensor_name: Name of the input tensor.
-debug_urls: List of URLs to debug targets, e.g.,
-            file:///foo/tfdbg_dump, grpc:://localhost:11011
+input_min: If range_given, this is the min of the range, otherwise this input
+           will be ignored.
+input_max: If range_given, this is the max of the range, otherwise this input
+           will be ignored.
 )doc");
 
 REGISTER_OP("QuantizeV2")
@@ -4349,7 +4630,7 @@ each value by 128 prior to casting.
 
 If the mode is 'MIN_FIRST', then this approach is used:
 
-```
+```c++
 number_of_steps = 1 << (# of bits in T)
 range_adjust = number_of_steps / (number_of_steps - 1)
 range = (range_max - range_min) * range_adjust
@@ -4430,6 +4711,51 @@ output_min: This value is copied from input_min.
 output_max: This value is copied from input_max.
 )Doc");
 
+REGISTER_OP("QuantizedInstanceNorm")
+    .Input("x: T")
+    .Input("x_min: float")
+    .Input("x_max: float")
+    .Output("y: T")
+    .Output("y_min: float")
+    .Output("y_max: float")
+    .Attr("T: quantizedtype")
+    .Attr("output_range_given: bool = false")
+    .Attr("given_y_min: float = 0")
+    .Attr("given_y_max: float = 0")
+    .Attr("variance_epsilon: float = 1e-5")
+    .Attr("min_separation: float = 1e-3")
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      shape_inference::ShapeHandle unused;
+      // x should be a rank 4 tensor.
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(0), 4, &unused));
+      // Assert x_min and x_max are scalars (rank 0).
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 0, &unused));
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 0, &unused));
+      // y has the same shape as x.
+      TF_RETURN_IF_ERROR(shape_inference::UnchangedShape(c));
+      // y_min and y_max are scalars.
+      c->set_output(1, c->Scalar());
+      c->set_output(2, c->Scalar());
+      return Status::OK();
+    })
+    .Doc(R"doc(
+Quantized Instance normalization.
+
+x: A 4D input Tensor.
+x_min: The value represented by the lowest quantized input.
+x_max: The value represented by the highest quantized input.
+y: A 4D Tensor.
+y_min: The value represented by the lowest quantized output.
+y_max: The value represented by the highest quantized output.
+output_range_given: If True, `given_y_min` and `given_y_min`
+  and `given_y_max` are used as the output range. Otherwise,
+  the implementation computes the output range.
+given_y_min: Output in `y_min` if `output_range_given` is True.
+given_y_max: Output in `y_max` if `output_range_given` is True.
+variance_epsilon: A small float number to avoid dividing by 0.
+min_separation: Minimum value of `y_max - y_min`
+)doc");
+
 namespace {
 
 Status ScatterNdShape(InferenceContext* c) {
@@ -4466,8 +4792,9 @@ Status ScatterNdShape(InferenceContext* c) {
       Status s = c->Merge(prefix_indices, prefix_updates, &unused);
       if (!s.ok()) {
         return errors::InvalidArgument(
-            "The outer ", outer_dims, " dimensions of indices.shape=",
-            c->DebugString(indices_shape), " must match the outer ", outer_dims,
+            "The outer ", outer_dims,
+            " dimensions of indices.shape=", c->DebugString(indices_shape),
+            " must match the outer ", outer_dims,
             " dimensions of updates.shape=", c->DebugString(updates_shape),
             ": ", s.error_message());
       }
@@ -4503,47 +4830,47 @@ REGISTER_OP("ScatterNd")
     .Attr("T: type")
     .Attr("Tindices: {int32, int64}")
     .SetShapeFn(ScatterNdShape)
-    .Doc(
-        R"doc(Creates a new tensor by applying sparse `updates` to individual
-values or slices within a zero tensor of the given `shape` tensor according to
+    .Doc(R"doc(
+Scatter `updates` into a new (initially zero) tensor according to `indices`.
+
+Creates a new tensor by applying sparse `updates` to individual
+values or slices within a zero tensor of the given `shape` according to
 indices.  This operator is the inverse of the [tf.gather_nd](#gather_nd)
 operator which extracts values or slices from a given tensor.
 
-TODO(simister): Add a link to Variable.__getitem__ documentation on slice
-syntax.
+**WARNING**: The order in which updates are applied is nondeterministic, so the
+output will be nondeterministic if `indices` contains duplicates.
 
-`shape` is a `TensorShape` with rank `P` and `indices` is a `Tensor` of rank
-`Q`.
+`indices` is an integer tensor containing indices into a new tensor of shape
+`shape`.  The last dimension of `indices` can be at most the rank of `shape`:
 
-`indices` must be integer tensor, containing indices into `shape`.
-It must be shape `[d_0, ..., d_{Q-2}, K]` where `0 < K <= P`.
+    indices.shape[-1] <= shape.rank
 
-The innermost dimension of `indices` (with length `K`) corresponds to
-indices into elements (if `K = P`) or slices (if `K < P`) along the `K`th
-dimension of `shape`.
+The last dimension of `indices` corresponds to indices into elements
+(if `indices.shape[-1] = shape.rank`) or slices
+(if `indices.shape[-1] < shape.rank`) along dimension `indices.shape[-1]` of
+`shape`.  `updates` is a tensor with shape
 
-`updates` is Tensor of rank `Q-1+P-K` with shape:
-
-```
-[d_0, ..., d_{Q-2}, shape[K], ..., shape[P-1]].
-```
+    indices.shape[:-1] + shape[indices.shape[-1]:]
 
 The simplest form of scatter is to insert individual elements in a tensor by
 index. For example, say we want to insert 4 scattered elements in a rank-1
 tensor with 8 elements.
 
 <div style="width:70%; margin:auto; margin-bottom:10px; margin-top:20px;">
-<img style="width:100%" src="../../images/ScatterNd1.png" alt>
+<img style="width:100%" src="https://www.tensorflow.org/images/ScatterNd1.png" alt>
 </div>
 
 In Python, this scatter operation would look like this:
 
+```python
     indices = tf.constant([[4], [3], [1], [7]])
     updates = tf.constant([9, 10, 11, 12])
     shape = tf.constant([8])
     scatter = tf.scatter_nd(indices, updates, shape)
     with tf.Session() as sess:
-      print sess.run(scatter)
+      print(sess.run(scatter))
+```
 
 The resulting tensor would look like this:
 
@@ -4554,11 +4881,12 @@ example, if we wanted to insert two slices in the first dimension of a
 rank-3 tensor with two matrices of new values.
 
 <div style="width:70%; margin:auto; margin-bottom:10px; margin-top:20px;">
-<img style="width:100%" src="../../images/ScatterNd2.png" alt>
+<img style="width:100%" src="https://www.tensorflow.org/images/ScatterNd2.png" alt>
 </div>
 
 In Python, this scatter operation would look like this:
 
+```python
     indices = tf.constant([[0], [2]])
     updates = tf.constant([[[5, 5, 5, 5], [6, 6, 6, 6],
                             [7, 7, 7, 7], [8, 8, 8, 8]],
@@ -4567,7 +4895,8 @@ In Python, this scatter operation would look like this:
     shape = tf.constant([4, 4, 4])
     scatter = tf.scatter_nd(indices, updates, shape)
     with tf.Session() as sess:
-      print sess.run(scatter)
+      print(sess.run(scatter))
+```
 
 The resulting tensor would look like this:
 
@@ -4576,11 +4905,9 @@ The resulting tensor would look like this:
      [[5, 5, 5, 5], [6, 6, 6, 6], [7, 7, 7, 7], [8, 8, 8, 8]],
      [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]]
 
-indices: A Tensor. Must be one of the following types: int32, int64.
-  A tensor of indices into ref.
-updates: A Tensor. Must have the same type as tensor. A tensor of updated values
-  to store in ref.
-shape: A vector. The shape of the resulting tensor.
+indices: Index tensor.
+updates: Updates to scatter into output.
+shape: 1-D. The shape of the resulting tensor.
 output: A new tensor with the given shape and updates applied according
   to the indices.
 )doc");
@@ -4588,6 +4915,7 @@ output: A new tensor with the given shape and updates applied according
 REGISTER_OP("FakeQuantWithMinMaxArgs")
     .Attr("min: float = -6.0")
     .Attr("max: float = 6.0")
+    .Attr("num_bits: int = 8")
     .Input("inputs: float")
     .Output("outputs: float")
     .SetShapeFn(shape_inference::UnchangedShape)
@@ -4597,6 +4925,7 @@ Fake-quantize the 'inputs' tensor, type float to 'outputs' tensor of same type.
 Attributes [min; max] define the clamping range for the 'inputs' data.  Op
 divides this range into 255 steps (total of 256 values), then replaces each
 'inputs' value with the closest of the quantized step values.
+'num_bits' is the bitwidth of the quantization; between 2 and 8, inclusive.
 
 Quantization is called fake since the output is still in floating point.
 )doc");
@@ -4604,6 +4933,7 @@ Quantization is called fake since the output is still in floating point.
 REGISTER_OP("FakeQuantWithMinMaxArgsGradient")
     .Attr("min: float = -6.0")
     .Attr("max: float = 6.0")
+    .Attr("num_bits: int = 8")
     .Input("gradients: float")
     .Input("inputs: float")
     .Output("backprops: float")
@@ -4618,6 +4948,7 @@ backprops: Backpropagated gradients below the FakeQuantWithMinMaxArgs operation:
 )doc");
 
 REGISTER_OP("FakeQuantWithMinMaxVars")
+    .Attr("num_bits: int = 8")
     .Input("inputs: float")
     .Input("min: float")
     .Input("max: float")
@@ -4630,18 +4961,19 @@ REGISTER_OP("FakeQuantWithMinMaxVars")
       return Status::OK();
     })
     .Doc(R"doc(
-Fake-quantize the 'inputs' tensor of type float and shape `[b, h, w, d]` via
-global float scalars `min` and `max` to 'outputs' tensor of same shape as
-`inputs`.
+Fake-quantize the 'inputs' tensor of type float via global float scalars `min`
+and `max` to 'outputs' tensor of same shape as `inputs`.
 
 [min; max] is the clamping range for the 'inputs' data.  Op divides this range
 into 255 steps (total of 256 values), then replaces each 'inputs' value with the
 closest of the quantized step values.
+'num_bits' is the bitwidth of the quantization; between 2 and 8, inclusive.
 
 This operation has a gradient and thus allows for training `min` and `max` values.
 )doc");
 
 REGISTER_OP("FakeQuantWithMinMaxVarsGradient")
+    .Attr("num_bits: int = 8")
     .Input("gradients: float")
     .Input("inputs: float")
     .Input("min: float")
@@ -4670,6 +5002,7 @@ Compute gradients for a FakeQuantWithMinMaxVars operation.
 gradients: Backpropagated gradients above the FakeQuantWithMinMaxVars operation.
 inputs: Values passed as inputs to the FakeQuantWithMinMaxVars operation.
 min, max: Quantization interval, scalar floats.
+num_bits: The bitwidth of the quantization; between 2 and 8, inclusive.
 backprops_wrt_input: Backpropagated gradients w.r.t. inputs:
   `gradients * (inputs >= min && inputs <= max)`.
 backprop_wrt_min: Backpropagated gradients w.r.t. min parameter:
@@ -4679,6 +5012,7 @@ backprop_wrt_max: Backpropagated gradients w.r.t. max parameter:
 )doc");
 
 REGISTER_OP("FakeQuantWithMinMaxVarsPerChannel")
+    .Attr("num_bits: int = 8")
     .Input("inputs: float")
     .Input("min: float")
     .Input("max: float")
@@ -4705,11 +5039,13 @@ to 'outputs' tensor of same shape as `inputs`.
 [min; max] is the clamping range for the 'inputs' data in the corresponding
 depth channel.  Op divides this range into 255 steps (total of 256 values), then
 replaces each 'inputs' value with the closest of the quantized step values.
+'num_bits' is the bitwidth of the quantization; between 2 and 8, inclusive.
 
 This operation has a gradient and thus allows for training `min` and `max` values.
 )doc");
 
 REGISTER_OP("FakeQuantWithMinMaxVarsPerChannelGradient")
+    .Attr("num_bits: int = 8")
     .Input("gradients: float")
     .Input("inputs: float")
     .Input("min: float")
@@ -4743,6 +5079,7 @@ gradients: Backpropagated gradients above the FakeQuantWithMinMaxVars operation,
 inputs: Values passed as inputs to the FakeQuantWithMinMaxVars operation, shape
   same as `gradients`.
 min, max: Quantization interval, floats of shape `[d]`.
+num_bits: The bitwidth of the quantization; between 2 and 8, inclusive.
 backprops_wrt_input: Backpropagated gradients w.r.t. inputs, shape same as
   `inputs`:
     `gradients * (inputs >= min && inputs <= max)`.
@@ -4751,6 +5088,27 @@ backprop_wrt_min: Backpropagated gradients w.r.t. min parameter, shape `[d]`:
 backprop_wrt_max: Backpropagated gradients w.r.t. max parameter, shape `[d]`:
   `sum_per_d(gradients * (inputs > max))`.
 )doc");
+
+#ifdef INTEL_MKL
+REGISTER_OP("_MklConcat")
+    .Input("concat_dim: int32")
+    .Input("values: N * T")
+    .Input("mkl_concat_dim: uint8")
+    .Input("mkl_values: N * uint8")
+    .Output("output: T")
+    .Output("mkl_output: uint8")
+    .Attr("N: int >= 2")
+    .Attr("T: type")
+    .SetShapeFn([](InferenceContext* c) {
+      return shape_inference::ConcatShape(c, c->num_inputs() - 3);
+    })
+    .Doc(R"doc(
+MKL version of Concat operator. Uses MKL DNN APIs to perform concatenation.
+
+NOTE Do not invoke this operator directly in Python. Graph rewrite pass is
+expected to invoke these operators.
+)doc");
+#endif
 
 // Deprecated op registrations:
 

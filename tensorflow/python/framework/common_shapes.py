@@ -20,7 +20,6 @@ from __future__ import print_function
 import numpy as np
 import six.moves
 
-from tensorflow.core.framework import types_pb2
 from tensorflow.python import pywrap_tensorflow
 from tensorflow.python.framework import cpp_shape_inference_pb2
 from tensorflow.python.framework import errors
@@ -597,8 +596,7 @@ def call_cpp_shape_fn(op,
     # calls the C / C-API directly, we should be able to remove this.
     return {
         "shapes": [tensor_shape.TensorShape(op.get_attr("value").tensor_shape)],
-        "handle_shapes": [tensor_shape.TensorShape(None).as_proto()],
-        "handle_dtypes": [types_pb2.DT_INVALID]
+        "handle_data": [None]
     }
 
   input_tensors_needed = input_tensors_needed or []
@@ -635,14 +633,15 @@ def _call_cpp_shape_fn_impl(
     input_tensors_as_shapes_needed,
     debug_python_shape_fn, require_shape_fn):
   """Core implementaton of call_cpp_shape_fn."""
+  graph_def_version = op.graph.graph_def_versions.producer
   node_def_str = op.node_def.SerializeToString()
 
   def tensor_to_inference_result(t):
     r = cpp_shape_inference_pb2.CppShapeInferenceResult()
     r.shape.CopyFrom(t.get_shape().as_proto())
     # pylint: disable=protected-access
-    r.handle_shape.CopyFrom(t._handle_shape)
-    r.handle_dtype = t._handle_dtype
+    if t._handle_data is not None:
+      r.handle_data.CopyFrom(t._handle_data)
     # pylint: enable=protected-access
     return r.SerializeToString()
   input_shapes = [tensor_to_inference_result(i) for i in op.inputs]
@@ -666,8 +665,8 @@ def _call_cpp_shape_fn_impl(
   try:
     with errors.raise_exception_on_not_ok_status() as status:
       output = pywrap_tensorflow.RunCppShapeInference(
-          node_def_str, input_shapes, input_tensors, input_tensors_as_shapes,
-          status)
+          graph_def_version, node_def_str, input_shapes, input_tensors,
+          input_tensors_as_shapes, status)
   except errors.InvalidArgumentError as err:
     if err.message.startswith("No shape inference function exists for op"):
       missing_shape_fn = True
@@ -688,8 +687,9 @@ def _call_cpp_shape_fn_impl(
       for s in output_shapes
   ]
   result = [r.shape for r in result_protos]
-  result_handle_shapes = [r.handle_shape for r in result_protos]
-  result_handle_dtypes = [r.handle_dtype for r in result_protos]
+  result_handle_data = [
+      r.handle_data if r.handle_data.is_set else None for r in result_protos
+  ]
 
   if debug_python_shape_fn:
     try:
@@ -707,10 +707,11 @@ def _call_cpp_shape_fn_impl(
                str(result_as_shapes), str(python_result), str(op.node_def),
                ",".join([str(i.get_shape()) for i in op.inputs])))
 
-  return {"shapes": result,
-          "handle_shapes": result_handle_shapes,
-          "handle_dtypes": result_handle_dtypes,
-          "inputs_needed": output[-1]}
+  return {
+      "shapes": result,
+      "handle_data": result_handle_data,
+      "inputs_needed": output[-1]
+  }
 
 # pylint: disable=protected-access
 ops._set_call_cpp_shape_fn(call_cpp_shape_fn)

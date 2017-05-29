@@ -439,7 +439,9 @@ struct use_bcast_optimization<double> {
 // sqrt(x) = x^(1/2)
 // rsqrt(x) = x^(-1/2)
 // exp(x) = e^x
+// expm1(x) = e^x - 1
 // log(x) = natural logarithm of x
+// log1p(x) = natural logarithm of 1 + x
 // tanh = (exp(x) - exp(-x)) / (exp(x) + exp(-x))
 // sigmoid = 1 / (1 + exp(-x))  // a.k.a, logistic
 //
@@ -470,7 +472,10 @@ template <typename T>
 struct exp : base<T, Eigen::internal::scalar_exp_op<T> > {};
 
 template <typename T>
-struct log : base<T, Eigen::internal::scalar_log_op<T> > {};
+struct expm1 : base<T, Eigen::internal::scalar_expm1_op<T>> {};
+
+template <typename T>
+struct log : base<T, Eigen::internal::scalar_log_op<T>> {};
 
 template <typename T>
 struct log1p : base<T, Eigen::internal::scalar_log1p_op<T> > {};
@@ -653,6 +658,22 @@ struct zeta : base<T, Eigen::internal::scalar_zeta_op<T>> {};
 template <typename T>
 struct polygamma : base<T, Eigen::internal::scalar_polygamma_op<T>> {};
 
+template <typename Scalar>
+struct scalar_atan2_op {
+  EIGEN_EMPTY_STRUCT_CTOR(scalar_atan2_op)
+  EIGEN_DEVICE_FUNC EIGEN_STRONG_INLINE Scalar
+  operator()(const Scalar& y, const Scalar& x) const {
+#if GOOGLE_CUDA
+    return ::atan2(y, x);
+#else
+    return std::atan2(y, x);
+#endif
+  }
+};
+
+template <typename T>
+struct atan2 : base<T, scalar_atan2_op<T>> {};
+
 template <typename T>
 struct squared_difference
     : base<T, Eigen::internal::scalar_compose_op<
@@ -746,6 +767,13 @@ struct BinaryFunctor {
              typename TTypes<typename Functor::in_type, NDIMS>::ConstTensor in1,
              typename Eigen::array<Eigen::DenseIndex, NDIMS> bcast1,
              bool* error);
+};
+
+template <typename Device, typename T>
+struct ApproximateEqual {
+  void operator()(const Device& d, typename TTypes<T>::ConstFlat x,
+                  typename TTypes<T>::ConstFlat y, T tolerance,
+                  typename TTypes<bool>::Flat z);
 };
 
 template <int NDIMS>

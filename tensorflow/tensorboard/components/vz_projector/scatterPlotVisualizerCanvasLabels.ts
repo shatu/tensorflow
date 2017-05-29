@@ -13,7 +13,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-import {DataSet} from './data';
+import * as d3 from 'd3';  // from //third_party/javascript/typings/d3_v4
 import {BoundingBox, CollisionGrid} from './label';
 import {CameraType, RenderContext} from './renderContext';
 import {ScatterPlotVisualizer} from './scatterPlotVisualizer';
@@ -29,21 +29,20 @@ const LABEL_FILL_WIDTH = 6;
  */
 export class ScatterPlotVisualizerCanvasLabels implements
     ScatterPlotVisualizer {
-  private dataSet: DataSet;
   private worldSpacePointPositions: Float32Array;
   private gc: CanvasRenderingContext2D;
   private canvas: HTMLCanvasElement;
   private labelsActive: boolean = true;
 
-  constructor(container: d3.Selection<any>) {
-    this.canvas = container.append('canvas').node() as HTMLCanvasElement;
-    this.gc = this.canvas.getContext('2d');
-    d3.select(this.canvas).style({position: 'absolute', left: 0, top: 0});
-    this.canvas.style.pointerEvents = 'none';
-  }
+  constructor(container: HTMLElement) {
+    this.canvas = document.createElement('canvas');
+    container.appendChild(this.canvas);
 
-  setDataSet(ds: DataSet) {
-    this.dataSet = ds;
+    this.gc = this.canvas.getContext('2d');
+    this.canvas.style.position = 'absolute';
+    this.canvas.style.left = '0';
+    this.canvas.style.top = '0';
+    this.canvas.style.pointerEvents = 'none';
   }
 
   private removeAllLabels() {
@@ -54,9 +53,6 @@ export class ScatterPlotVisualizerCanvasLabels implements
 
   /** Render all of the non-overlapping visible labels to the canvas. */
   private makeLabels(rc: RenderContext) {
-    if (this.dataSet == null) {
-      return;
-    }
     if ((rc.labels == null) || (rc.labels.pointIndices.length === 0)) {
       return;
     }
@@ -78,7 +74,7 @@ export class ScatterPlotVisualizerCanvasLabels implements
     }
 
     let opacityMap =
-        d3.scale.pow()
+        d3.scalePow()
             .exponent(Math.E)
             .domain([rc.farthestCameraSpacePointZ, rc.nearestCameraSpacePointZ])
             .range([0.1, 1]);
@@ -160,10 +156,10 @@ export class ScatterPlotVisualizerCanvasLabels implements
 
   onResize(newWidth: number, newHeight: number) {
     let dpr = window.devicePixelRatio;
-    d3.select(this.canvas)
-        .attr('width', newWidth * dpr)
-        .attr('height', newHeight * dpr)
-        .style({width: newWidth + 'px', height: newHeight + 'px'});
+    this.canvas.width = newWidth * dpr;
+    this.canvas.height = newHeight * dpr;
+    this.canvas.style.width = newWidth + 'px';
+    this.canvas.style.height = newHeight + 'px';
   }
 
   dispose() {

@@ -146,6 +146,7 @@ export class ScatterPlotVisualizerSprites implements ScatterPlotVisualizer {
   private standinTextureForPoints: THREE.Texture;
   private spritesPerRow: number;
   private spritesPerColumn: number;
+  private spriteDimensions: [number, number];
   private spriteIndexBufferAttribute: THREE.BufferAttribute;
   private renderMaterial: THREE.ShaderMaterial;
   private pickingMaterial: THREE.ShaderMaterial;
@@ -168,7 +169,7 @@ export class ScatterPlotVisualizerSprites implements ScatterPlotVisualizer {
     this.texture = util.createTexture(spriteAtlas);
     this.spritesPerRow = spriteAtlas.width / spriteDimensions[0];
     this.spritesPerColumn = spriteAtlas.height / spriteDimensions[1];
-
+    this.spriteDimensions = spriteDimensions;
     this.spriteIndexBufferAttribute =
         new THREE.BufferAttribute(spriteIndices, INDEX_NUM_ELEMENTS);
 
@@ -242,7 +243,7 @@ export class ScatterPlotVisualizerSprites implements ScatterPlotVisualizer {
 
   private calculatePointSize(sceneIs3D: boolean): number {
     if (this.texture != null) {
-      return IMAGE_SIZE;
+      return sceneIs3D ? IMAGE_SIZE : this.spriteDimensions[0];
     }
     const n = (this.worldSpacePointPositions != null) ?
         (this.worldSpacePointPositions.length / XYZ_NUM_ELEMENTS) :
@@ -303,7 +304,6 @@ export class ScatterPlotVisualizerSprites implements ScatterPlotVisualizer {
   dispose() {
     this.disposeGeometry();
     this.disposeTextureAtlas();
-    this.worldSpacePointPositions = null;
   }
 
   private disposeGeometry() {
@@ -311,6 +311,7 @@ export class ScatterPlotVisualizerSprites implements ScatterPlotVisualizer {
       this.scene.remove(this.points);
       this.points.geometry.dispose();
       this.points = null;
+      this.worldSpacePointPositions = null;
     }
   }
 
@@ -329,7 +330,7 @@ export class ScatterPlotVisualizerSprites implements ScatterPlotVisualizer {
 
   setSpriteAtlas(
       spriteImage: HTMLImageElement, spriteDimensions: [number, number],
-      spriteIndices: Uint8Array) {
+      spriteIndices: Float32Array) {
     this.disposeTextureAtlas();
     this.createTextureFromSpriteAtlas(
         spriteImage, spriteDimensions, spriteIndices);
@@ -345,14 +346,11 @@ export class ScatterPlotVisualizerSprites implements ScatterPlotVisualizer {
 
   onPointPositionsChanged(newPositions: Float32Array) {
     if ((newPositions == null) || (newPositions.length === 0)) {
-      this.disposeGeometry();
+      this.dispose();
       return;
     }
-
     if (this.points != null) {
-      const notEnoughSpace =
-          (this.worldSpacePointPositions.length < newPositions.length);
-      if (notEnoughSpace) {
+      if (this.worldSpacePointPositions.length !== newPositions.length) {
         this.disposeGeometry();
       }
     }
